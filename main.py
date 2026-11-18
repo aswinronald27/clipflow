@@ -2736,9 +2736,14 @@ def _run_gemini_stage(client, model_name, prompt, schema):
         response_mime_type="application/json",
         response_schema=schema,
     )
-    max_attempts = 4
+    max_attempts = 5
     current_model = model_name
-    fallback_model = (os.environ.get("GEMINI_FALLBACK_MODEL") or "gemini-2.5-flash").strip()
+    env_fallback = (os.environ.get("GEMINI_FALLBACK_MODEL") or "").strip()
+    fallback_candidates = []
+    for cand in (env_fallback, "gemini-3.8-flash", "gemini-3-flash-preview", "gemini-2.5-flash-lite"):
+        if cand and cand != model_name and cand not in fallback_candidates:
+            fallback_candidates.append(cand)
+    tried_fallbacks = set()
     for attempt in range(1, max_attempts + 1):
         try:
             if use_local:
@@ -2763,6 +2768,20 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             raise  # deterministic policy block — never retry
         except Exception as e:
             msg = str(e)
+            not_found = any(tok in msg for tok in ('404', 'NOT_FOUND', 'no longer available'))
+            # If a fallback model is unavailable/deprecated on this API key, skip it
+            # rather than aborting the whole job — try the next fallback or retry primary.
+            if not use_local and not_found and current_model != model_name and attempt < max_attempts:
+                tried_fallbacks.add(current_model)
+                next_fb = next((m for m in fallback_candidates if m not in tried_fallbacks), None)
+                if next_fb:
+                    print(f"⚠️ Fallback model {current_model} unavailable (404) — trying {next_fb}...", flush=True)
+                    current_model = next_fb
+                else:
+                    print(f"⚠️ Fallback model {current_model} unavailable (404) — retrying primary {model_name}...", flush=True)
+                    current_model = model_name
+                    time.sleep(5)
+                continue
             transient = any(tok in msg for tok in (
                 '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
                 '500', 'INTERNAL', 'overloaded', 'Deadline', 'timeout', 'Timeout', 'timed out',
@@ -2775,14 +2794,22 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             if attempt == max_attempts or not transient:
                 raise
             # If the primary Gemini model is overloaded/timed out (503 / ReadTimeout),
-            # immediately switch to the fallback model on the next try instead of hanging.
+            # try the next available fallback model instead of hanging on the same endpoint.
             overloaded = any(tok in msg for tok in (
                 '503', 'UNAVAILABLE', 'overloaded', 'ReadTimeout', 'Timeout', 'timeout', 'timed out', 'Deadline'))
-            if (not use_local and overloaded and fallback_model
-                    and current_model != fallback_model):
-                print(f"🔁 {current_model} unavailable/timed out — falling back to {fallback_model}...", flush=True)
-                current_model = fallback_model
+            next_fb = next((m for m in fallback_candidates if m not in tried_fallbacks), None)
+            if not use_local and overloaded and next_fb and current_model == model_name:
+                print(f"🔁 {current_model} unavailable/timed out ({msg[:120]}) — falling back to {next_fb}...", flush=True)
+                current_model = next_fb
                 time.sleep(2)
+                continue
+            if not use_local and overloaded and current_model != model_name:
+                tried_fallbacks.add(current_model)
+                next_fb = next((m for m in fallback_candidates if m not in tried_fallbacks), None)
+                target_model = next_fb or model_name
+                print(f"🔁 {current_model} unavailable/timed out ({msg[:120]}) — switching to {target_model}...", flush=True)
+                current_model = target_model
+                time.sleep(4)
                 continue
             wait = 5 * (2 ** (attempt - 1))
             who = "LLM server" if use_local else "Gemini"
@@ -2855,7 +2882,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None, chat_h
             print("❌ Error: GEMINI_API_KEY not found in environment variables "
                   "(set it, or point LLM_BASE_URL at an OpenAI-compatible server).")
             return None
-        timeout_ms = int(os.environ.get("GEMINI_TIMEOUT_MS", "45000") or 45000)
+        timeout_ms = int(os.environ.get("GEMINI_TIMEOUT_MS", "90000") or 90000)
         client = genai.Client(api_key=api_key, http_options=genai_types.HttpOptions(timeout=timeout_ms))
         model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
     print(f"\U0001f916  Model: {model_name} | language: {language}")
