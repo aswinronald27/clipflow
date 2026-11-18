@@ -60,6 +60,20 @@ function formatDuration(clip) {
     return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
 }
 
+function sanitizeDownloadFilename(title, fallback) {
+    const raw = String(title || '').trim();
+    if (!raw) return fallback;
+    const cleaned = raw
+        .replace(/:/g, ' - ')
+        .replace(/[<>"/\\|?*\x00-\x1f]/g, '')
+        .replace(/\s+/g, ' ')
+        .replace(/[. ]+$/g, '')
+        .trim()
+        .slice(0, 100)
+        .replace(/[. ]+$/g, '');
+    return cleaned || fallback;
+}
+
 export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null, onModeChanged = null, onUpgrade = null }) {
     const [showModal, setShowModal] = useState(false);
     // The "why" line is clamped to two lines so cards in a row stay level;
@@ -176,7 +190,10 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
             const a = document.createElement('a');
             a.style.display = 'none';
             a.href = url;
-            a.download = `clip-${index + 1}.mp4`;
+            const ytTitle = (postTitle && postTitle !== 'Viral Short' ? postTitle : '')
+                || clip.video_title_for_youtube_short
+                || clip.title;
+            a.download = `${sanitizeDownloadFilename(ytTitle, `clip-${index + 1}`)}.mp4`;
             document.body.appendChild(a);
             a.click();
             window.URL.revokeObjectURL(url);

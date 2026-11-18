@@ -420,10 +420,10 @@ export default function MediaInput({ onProcess, isProcessing }) {
                             <div>
                                 <p className="eyebrow mb-1.5">clips to aim for</p>
                                 <input
-                                    type="number" min="1" max="15" step="1"
+                                    type="number" min="1" max="25" step="1"
                                     value={targetClips}
                                     onChange={(e) => setTargetClips(e.target.value)}
-                                    placeholder="auto"
+                                    placeholder="all best"
                                     className="input-field"
                                 />
                             </div>

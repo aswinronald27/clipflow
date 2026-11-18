@@ -165,6 +165,43 @@ def trim_to_best(shorts, max_clips):
     return [item for _, item in sorted(best, key=lambda pair: pair[0])]
 
 
+def select_all_best_windows(windows, scored, min_score=70, max_windows=25, fallback_min=3):
+    """Select every scoring window that meets ``min_score`` (up to ``max_windows``)
+    so long, action-packed videos are not artificially capped at 10 windows.
+    Falls back to the top ``fallback_min`` scored windows on quiet videos."""
+    by_id = {w["id"]: w for w in (windows or [])}
+    ranked_scored = sorted(
+        (s for s in (scored or []) if s.get("id") in by_id),
+        key=lambda s: float(s.get("score") or 0),
+        reverse=True,
+    )
+    strong = [by_id[s["id"]] for s in ranked_scored if float(s.get("score") or 0) >= min_score]
+    if len(strong) >= fallback_min:
+        return strong[:max_windows]
+    top_n = max(fallback_min, len(strong))
+    picked = [by_id[s["id"]] for s in ranked_scored[:top_n]]
+    return picked or list(windows or [])[:fallback_min]
+
+
+def filter_all_best_clips(shorts, min_score=70, max_clips=25, fallback_min=3):
+    """Keep every clip scoring >= ``min_score`` (up to ``max_clips``) instead of
+    forcing a fixed target count. Preserves transcript order via ``trim_to_best``."""
+    items = list(shorts or [])
+    if not items:
+        return []
+
+    def _score(c):
+        try:
+            return float(c.get("predicted_score") or 0)
+        except (TypeError, ValueError, AttributeError):
+            return 0.0
+
+    strong = [c for c in items if _score(c) >= min_score]
+    if len(strong) >= fallback_min:
+        return trim_to_best(strong, max_clips)
+    return trim_to_best(items, min(len(items), max(fallback_min, len(strong))))
+
+
 def vision_segments(video_duration, segment_seconds, max_segments):
     """Split a silent source into near-equal ``(start, end)`` stretches for
     the vision pass, each at most ``segment_seconds`` long.

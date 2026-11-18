@@ -334,3 +334,37 @@ def test_vision_segments_are_capped():
     segs = vision_segments(8 * 3600, 2400, 8)  # 12 stretches wanted
     assert len(segs) == 8
     assert segs[-1][1] < 8 * 3600
+
+
+# --- All-best moment selection --------------------------------------------- #
+
+def test_select_all_best_windows_keeps_all_high_scorers():
+    from clip_selection import select_all_best_windows
+    windows = [{"id": f"w{i}"} for i in range(20)]
+    scored = [{"id": f"w{i}", "score": 85 if i < 14 else 40} for i in range(20)]
+    picked = select_all_best_windows(windows, scored, min_score=70, max_windows=20)
+    assert len(picked) == 14
+    assert [w["id"] for w in picked] == [f"w{i}" for i in range(14)]
+
+
+def test_select_all_best_windows_falls_back_on_quiet_videos():
+    from clip_selection import select_all_best_windows
+    windows = [{"id": f"w{i}"} for i in range(10)]
+    scored = [{"id": f"w{i}", "score": 50 - i} for i in range(10)]
+    picked = select_all_best_windows(windows, scored, min_score=70, fallback_min=4)
+    assert len(picked) == 4
+    assert [w["id"] for w in picked] == ["w0", "w1", "w2", "w3"]
+
+
+def test_filter_all_best_clips_keeps_above_score_and_preserves_order():
+    from clip_selection import filter_all_best_clips
+    clips = [
+        {"start": 10, "end": 30, "predicted_score": 60},
+        {"start": 50, "end": 75, "predicted_score": 88},
+        {"start": 100, "end": 120, "predicted_score": 92},
+        {"start": 150, "end": 170, "predicted_score": 45},
+        {"start": 200, "end": 220, "predicted_score": 79},
+    ]
+    filtered = filter_all_best_clips(clips, min_score=70, max_clips=10, fallback_min=2)
+    assert len(filtered) == 3
+    assert [c["start"] for c in filtered] == [50, 100, 200]

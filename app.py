@@ -6171,7 +6171,7 @@ async def process_endpoint(
                                 detail=f"{name} must be between {lo:g} and {hi:g}")
         return int(val) if integer else val
 
-    n_clips = _gen_control(target_clips, "target_clips", 1, 15, integer=True)
+    n_clips = _gen_control(target_clips, "target_clips", 1, 25, integer=True)
     min_secs = _gen_control(clip_min_seconds, "clip_min_seconds", 5, 175)
     max_secs = _gen_control(clip_max_seconds, "clip_max_seconds", 10, 180)
     if min_secs is not None and max_secs is not None and max_secs < min_secs + 5:
@@ -7159,9 +7159,18 @@ async def download_all_clips(job_id: str, request: Request):
     # to the canonical name a job/restore rebuilds, instead of finding nothing.
     base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
     mem_clips = ((jobs.get(job_id) or {}).get('result') or {}).get('clips') or []
+    shorts_meta = data.get('shorts', [])
+
+    def _safe_name(text: str, fallback: str) -> str:
+        raw = re.sub(r'[:/\\?*"<>|\x00-\x1f]', '', str(text or '')).strip()
+        raw = re.sub(r'\s+', ' ', raw).strip(' .')
+        return raw[:90].strip(' .') or fallback
+
+    clean_base = base_name[len(job_id) + 1:] if base_name.startswith(f"{job_id}_") else base_name
+    source_title = _safe_name(clean_base.replace('_', ' '), f"clips_{job_id[:8]}")
 
     files = []
-    for i, clip in enumerate(data.get('shorts', [])):
+    for i, clip in enumerate(shorts_meta):
         url = None
         if i < len(mem_clips):
             url = (mem_clips[i] or {}).get('video_url')
@@ -7170,7 +7179,11 @@ async def download_all_clips(job_id: str, request: Request):
                     else _canonical_clip_file(output_dir, base_name, i))
         path = os.path.join(output_dir, filename)
         if filename and os.path.exists(path):
-            files.append((i, path))
+            clip_title = _safe_name(
+                clip.get('video_title_for_youtube_short') or clip.get('title'),
+                f"clip_{i + 1:02d}",
+            )
+            files.append((i, path, clip_title))
 
     if not files:
         raise HTTPException(status_code=404, detail="No clip files found for this job")
@@ -7183,8 +7196,8 @@ async def download_all_clips(job_id: str, request: Request):
     def build_zip():
         # Videos are already compressed; store instead of deflate for speed.
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
-            for i, path in files:
-                zf.write(path, arcname=f"clip_{i + 1:02d}_{os.path.basename(path)}")
+            for i, path, clip_title in files:
+                zf.write(path, arcname=f"{i + 1:02d} - {clip_title}.mp4")
 
     def remove_zip():
         with suppress(FileNotFoundError):
@@ -7200,7 +7213,7 @@ async def download_all_clips(job_id: str, request: Request):
     return FileResponse(
         zip_path,
         media_type="application/zip",
-        filename=f"openshorts_clips_{job_id[:8]}.zip",
+        filename=f"{source_title}_clips.zip",
         background=BackgroundTask(remove_zip),
     )
 

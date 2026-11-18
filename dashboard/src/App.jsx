@@ -747,11 +747,20 @@ function App() {
     try {
       const res = await apiFetch(`/api/jobs/${jobId}/download-all`);
       if (!res.ok) throw new Error(await res.text());
+      const disp = res.headers.get('content-disposition') || '';
+      const utf8Match = /filename\*=UTF-8''([^;]+)/i.exec(disp);
+      const plainMatch = /filename="([^"]+)"/i.exec(disp);
+      let zipName = `openshorts_clips_${(jobId || '').slice(0, 8)}.zip`;
+      if (utf8Match && utf8Match[1]) {
+        try { zipName = decodeURIComponent(utf8Match[1]); } catch { /* ignore */ }
+      } else if (plainMatch && plainMatch[1]) {
+        zipName = plainMatch[1];
+      }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `openshorts_clips_${(jobId || '').slice(0, 8)}.zip`;
+      a.download = zipName;
       document.body.appendChild(a);
       a.click();
       a.remove();

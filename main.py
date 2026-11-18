@@ -34,7 +34,8 @@ import yt_account
 import twitch_signals
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
-                            score_batches, shortlist_target,
+                            filter_all_best_clips, score_batches,
+                            select_all_best_windows, shortlist_target,
                             snap_clip_to_words, trim_to_best,
                             vision_segments)
 from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, QUALITY,
@@ -2954,28 +2955,47 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None, chat_h
                 client, model_name, batch, _score_prompt,
                 gemini_worker.ScoreResponse, "windows", costs, "score"))
 
-        # Shortlist the top windows; scale with duration so long videos surface
-        # more candidates without exploding the detail call.
+        # Shortlist the top windows. In `all_best` mode (when no explicit clip count
+        # override was given), keep EVERY window scoring >= BEST_MOMENT_MIN_SCORE
+        # instead of capping at 10 windows / 6 clips.
+        all_best_mode = (
+            os.environ.get("CLIP_SELECTION_MODE", "").strip().lower() == "all_best"
+            and not os.environ.get("CLIP_TARGET_MIN", "").strip()
+            and not os.environ.get("CLIP_TARGET_MAX", "").strip()
+        )
+        best_min_score = int(os.environ.get("BEST_MOMENT_MIN_SCORE", "70") or 70)
+        max_best_windows = max(10, int(os.environ.get("MAX_BEST_WINDOWS", "25") or 25))
+        max_best_clips = max(12, int(os.environ.get("MAX_ALL_BEST_CLIPS", "25") or 25))
+
         scored.sort(key=lambda w: w.get("score", 0), reverse=True)
         by_id = {w["id"]: w for w in windows}
-        shortlist = [by_id[w["id"]] for w in scored[:target] if w.get("id") in by_id]
-        if not shortlist:
-            shortlist = windows[:target]  # scoring returned nothing usable
+        if all_best_mode:
+            shortlist = select_all_best_windows(
+                windows, scored, min_score=best_min_score, max_windows=max_best_windows)
+            effective_target = max(target, len(shortlist))
+        else:
+            shortlist = [by_id[w["id"]] for w in scored[:target] if w.get("id") in by_id]
+            if not shortlist:
+                shortlist = windows[:target]  # scoring returned nothing usable
+            effective_target = target
         if heat:
             before = {w["id"] for w in shortlist}
             ranked = [by_id[w["id"]] for w in scored if w.get("id") in by_id] or windows
-            shortlist = twitch_signals.promote_hot_windows(shortlist, ranked, heat, target)
+            shortlist = twitch_signals.promote_hot_windows(shortlist, ranked, heat, effective_target)
             added = [w["id"] for w in shortlist if w["id"] not in before]
             if added:
                 print(f"   👀 Promoted {len(added)} window(s) viewers clipped: {added}")
         if chat_heat:
             before = {w["id"] for w in shortlist}
             ranked = [by_id[w["id"]] for w in scored if w.get("id") in by_id] or windows
-            shortlist = youtube_live_chat.promote_chat_hot_windows(shortlist, ranked, chat_heat, target)
+            shortlist = youtube_live_chat.promote_chat_hot_windows(shortlist, ranked, chat_heat, effective_target)
             added = [w["id"] for w in shortlist if w["id"] not in before]
             if added:
                 print(f"   💬 Promoted {len(added)} live-chat hype window(s): {added}")
-        print(f"   Shortlisted {len(shortlist)} window(s) for detail.")
+        if all_best_mode:
+            print(f"   🔥 All-best mode: shortlisted {len(shortlist)} high-scoring window(s) (score ≥ {best_min_score}).")
+        else:
+            print(f"   Shortlisted {len(shortlist)} window(s) for detail.")
 
         # --- Pass 2: detailed clip extraction on the shortlist ---
         min_clips, max_clips = clip_count_targets(len(shortlist))
@@ -2991,40 +3011,61 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None, chat_h
                     windows_json=json.dumps(_payload(ws), ensure_ascii=False))
             return build
 
-        shorts = _run_stage_split(client, model_name, shortlist,
-                                  _detail_prompt_for(min_clips, max_clips),
-                                  gemini_worker.DetailResponse, "shorts", costs, "detail")
+        if all_best_mode:
+            # Batch shortlisted windows into small groups (up to 6 windows each) so
+            # Gemini extracts every genuine viral moment across the entire video
+            # instead of stopping after a handful of clips.
+            shorts = []
+            detail_batches = score_batches(shortlist, 6)
+            for b_idx, b_ws in enumerate(detail_batches, 1):
+                b_lo = max(1, len(b_ws) // 2)
+                b_hi = max(b_lo + 1, len(b_ws) * 2)
+                batch_shorts = _run_stage_split(
+                    client, model_name, b_ws,
+                    _detail_prompt_for(b_lo, b_hi),
+                    gemini_worker.DetailResponse, "shorts", costs, f"detail-{b_idx}")
+                shorts.extend(batch_shorts or [])
+            shorts.sort(key=lambda s: float(s.get("start") or 0))
+            before_filter = len(shorts)
+            shorts = filter_all_best_clips(
+                shorts, min_score=best_min_score, max_clips=max_best_clips)
+            if len(shorts) != before_filter:
+                print(f"   Kept {len(shorts)} best moment(s) of {before_filter} proposed (score ≥ {best_min_score}).")
+        else:
+            shorts = _run_stage_split(client, model_name, shortlist,
+                                      _detail_prompt_for(min_clips, max_clips),
+                                      gemini_worker.DetailResponse, "shorts", costs, "detail")
 
-        # The floor lived only in the prompt, and a prompt is not a contract:
-        # the model regularly returned half of it and the job shipped that.
-        # The windows it passed over are the cheap second chance — they are
-        # already the best-scoring ones in the video — so they get one more
-        # call for the missing clips. It may still come back empty, which is
-        # the honest answer for material that does not hold more.
-        if len(shorts) < min_clips:
-            used = {str(s.get("source_window_id") or "") for s in shorts}
-            spare = [w for w in shortlist if w["id"] not in used]
-            if spare:
-                missing = min_clips - len(shorts)
-                print(f"   Detail returned {len(shorts)} clip(s) of {min_clips}; "
-                      f"asking the {len(spare)} unused window(s) for {missing} more.")
-                extra = _run_stage_split(
-                    client, model_name, spare,
-                    _detail_prompt_for(missing, max(missing, len(spare))),
-                    gemini_worker.DetailResponse, "shorts", costs, "detail-floor")
-                if extra:
-                    shorts = sorted(shorts + extra,
-                                    key=lambda s: float(s.get("start") or 0))
-                    print(f"   Recovered {len(extra)} clip(s) from them.")
+            # The floor lived only in the prompt, and a prompt is not a contract:
+            # the model regularly returned half of it and the job shipped that.
+            # The windows it passed over are the cheap second chance — they are
+            # already the best-scoring ones in the video — so they get one more
+            # call for the missing clips. It may still come back empty, which is
+            # the honest answer for material that does not hold more.
+            if len(shorts) < min_clips:
+                used = {str(s.get("source_window_id") or "") for s in shorts}
+                spare = [w for w in shortlist if w["id"] not in used]
+                if spare:
+                    missing = min_clips - len(shorts)
+                    print(f"   Detail returned {len(shorts)} clip(s) of {min_clips}; "
+                          f"asking the {len(spare)} unused window(s) for {missing} more.")
+                    extra = _run_stage_split(
+                        client, model_name, spare,
+                        _detail_prompt_for(missing, max(missing, len(spare))),
+                        gemini_worker.DetailResponse, "shorts", costs, "detail-floor")
+                    if extra:
+                        shorts = sorted(shorts + extra,
+                                        key=lambda s: float(s.get("start") or 0))
+                        print(f"   Recovered {len(extra)} clip(s) from them.")
 
-        if len(shorts) > max_clips:
-            # By score, never by position: the results arrive in transcript
-            # order, so slicing kept the earliest clips and silently dropped
-            # the back half of the video. See trim_to_best.
-            dropped = len(shorts) - max_clips
-            shorts = trim_to_best(shorts, max_clips)
-            print(f"   Kept the {max_clips} best-scoring clip(s) of "
-                  f"{max_clips + dropped}.")
+            if len(shorts) > max_clips:
+                # By score, never by position: the results arrive in transcript
+                # order, so slicing kept the earliest clips and silently dropped
+                # the back half of the video. See trim_to_best.
+                dropped = len(shorts) - max_clips
+                shorts = trim_to_best(shorts, max_clips)
+                print(f"   Kept the {max_clips} best-scoring clip(s) of "
+                      f"{max_clips + dropped}.")
         # Snap each proposed clip onto real word boundaries (+ a bit of silence).
         for s in shorts:
             # Keep the model's raw proposal: it is how boundary accuracy is
