@@ -454,3 +454,74 @@ coordinates them:
 
 Every deploy is a full build plus a handover, so batch small commits (tests,
 docs) with the next real change.
+
+## API under CPU pressure
+
+The API is one process (event loop, yt-dlp probes in threads) in the same
+container as the jobs. When the host runs out of CPU the loop slows, DB
+connections stay checked out longer and the pool fills. Two guards: the
+Postgres pool is `DB_POOL_SIZE` 15 + `DB_MAX_OVERFLOW` 15 with a
+`DB_POOL_TIMEOUT` of 10 s (the default 5 + 10 with 30 s turned a slow minute
+into minutes of 500s), and the owner check of a GET (every status poll)
+goes through `cloud/owner_cache.py`: the caller is remembered per credential
+for `OWNER_ID_TTL` (600 s) instead of loading the full user each time, and at
+most `OWNER_LOOKUP_CONCURRENCY` (8) of those lookups hold a pool connection at
+once, so polls can never take the connections login, checkout or the Stripe
+webhook need. With the gate full for `OWNER_LOOKUP_WAIT` (3 s) a caller seen in
+the last `OWNER_ID_STALE` (1 h) gets its last answer and an unknown one a 503
+with `Retry-After`. A ban, a revoked key (dashboard or OAuth revoke) and an
+erased account call `owner_cache.forget_user`, so they apply at once.
+
+The duration probe (yt-dlp, pure Python, about a second of CPU under the GIL)
+runs in a pool of `PROBE_PROCESSES` (12) spawned processes, not in a thread of
+the API process: at 30-50 probes a minute the threads took the GIL from the
+event loop and the pool filled even with CPU to spare. What a probe leaves in
+`cloud/metering` (quality facts, the static-pool verdict, paid proxy events)
+travels back with its result; `PROBE_PROCESSES=0` runs it in a thread. The
+pool is sized for waiting: a probe mostly sleeps on the YouTube account's
+turn, and 4 processes asleep queued the rest (estimate p50 45 s). The cost
+line (`/api/process/estimate`) gives up after `ESTIMATE_PROBE_TIMEOUT` (20 s).
+
+
+## Clips of a free job
+
+A job's render time grows with its clips (the cut, the reframe and the caption
+pass are per clip; only the download, the transcript and the selection are per
+job), so the number of clips a free job renders is what sizes the free queue's
+output to the hardware. `FREE_MAX_CLIPS` (unset or 0: no cap) caps it at
+dispatch (`app._cap_clips_at_dispatch`), through `CLIP_TARGET_MIN/MAX` like the
+slow lane's brake and like the user's own `target_clips`: the scoring pass
+still ranks every window and the best ones are kept. Only a job that carries
+the free-plan mark, was not bought with a top-up and is still at a free
+priority when it is dispatched: a job whose owner paid while it waited was
+raised and gets every clip. Decided at dispatch, so the jobs already waiting
+get the setting of the moment, here and on the remote worker. The job's log
+says it (`FREE_CLIPS_LOG`, kept by `log_view`). With the brake on, the lower
+of the two caps applies.
+
+The cap is for when people are waiting. With `FREE_QUIET_MAX_CLIPS` set (and
+larger), a free job gets that many while the whole free queue is short
+(`queue_mode.queue_quiet`): every lane's estimated wait, as the queue watch
+last measured it, under `FREE_QUIET_MINUTES` (default 10). No hysteresis on
+purpose: it is decided per job, and more clips per job lengthen the queue,
+which brings the lower cap back by itself. The measurement has to be recent
+(`QUIET_FIGURES_MAX_AGE`); with the saturation mode off or killed nobody
+measures and the lower cap stays.
+
+## Frame rate of free jobs
+
+Every pass after the cut (tracking, scene detection, the reframe render,
+captions, hook, the watermarked copy) reads the cut, so its frame rate sets
+the decoder and encoder work of the whole job. A free-plan job is cut at up to
+`FREE_MAX_FPS` (default 30, `0` keeps the source rate): the API puts
+`CUT_MAX_FPS` in the job's environment next to `WATERMARK` (and it travels to
+the remote worker as a job option), and `ffmpeg_utils.cut_rate_filter` adds
+`-vf fps=` to both the GPU and CPU cut. The new rate is the source's divided by
+a whole number (60 -> 30, 59.94 -> 29.97, 50 -> 25), so the kept frames are
+evenly spaced; a source under 1.5x the cap is left alone. Paid plans keep the
+source rate.
+
+Skipping the source's non-reference frames while decoding (`-skip_frame
+noref`) was measured and rejected: it saves part of the first read, but the
+frames it keeps are unevenly spaced and a quarter of the 30 fps output came
+out as repeats (visible judder).

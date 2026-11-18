@@ -9,8 +9,10 @@
 """
 import hashlib
 import hmac
+import os
 import re
 import secrets
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -80,9 +82,20 @@ class CurrentUser:
         self.upload_post_profile = upload_post_profile
 
 
+SUSPENDED_DETAIL = "This account is suspended. Contact info@openshorts.app."
+
+
+def is_banned(user) -> bool:
+    """True for an account banned by the support back-office. getattr: test
+    doubles and rows loaded before the column existed."""
+    return bool(user is not None and getattr(user, "ban_reason", None))
+
+
 async def _load_current_user(session, user_id) -> Optional["CurrentUser"]:
     user = await session.get(User, user_id)
-    if user is None:
+    if user is None or is_banned(user):
+        # A banned account authenticates as nobody: dashboard, API keys,
+        # OAuth tokens and Autopilot alike.
         return None
     sub = await metering._active_subscription(session, user_id)
     topups = await metering._topups_fifo(session, user_id)
@@ -101,6 +114,57 @@ async def _load_current_user(session, user_id) -> Optional["CurrentUser"]:
         plan=sub.plan if sub else ("free" if free else None),
         upload_post_profile=profile.profile_username if profile else None,
     )
+
+
+# The signed-in user, remembered for a few seconds. Every authenticated
+# request loaded it from scratch (four queries: user, subscription, top-ups,
+# Upload-Post profile), and the dashboard fires several of them per page plus
+# its polls: under load those loads held the whole Postgres pool. Only
+# read-only requests use the memory (``_CACHEABLE``): a submission, a checkout
+# or anything that spends minutes always loads the user fresh. A Stripe event
+# (plan, top-up) clears it all, and a ban, a revoked key or an erased account
+# clear that user (``owner_cache.forget_user``), so a change shows at once.
+CURRENT_USER_TTL = max(0.0, float(os.environ.get("CURRENT_USER_TTL", "15") or 0))
+_CACHEABLE_POSTS = frozenset({"/api/media-token", "/api/process/estimate"})
+_USER_CACHE_MAX = 20000
+_user_cache: dict = {}   # user id (str) -> (fresh_until monotonic, CurrentUser)
+
+
+def _cacheable(request) -> bool:
+    if CURRENT_USER_TTL <= 0:
+        return False
+    method = getattr(request, "method", "GET")
+    return method in ("GET", "HEAD") or (
+        method == "POST" and request.url.path in _CACHEABLE_POSTS)
+
+
+def _cached_user(user_id) -> Optional["CurrentUser"]:
+    hit = _user_cache.get(str(user_id))
+    if hit and hit[0] > time.monotonic():
+        return hit[1]
+    return None
+
+
+def _remember_user(user_id, current) -> None:
+    if current is None or CURRENT_USER_TTL <= 0:
+        return
+    now = time.monotonic()
+    if len(_user_cache) >= _USER_CACHE_MAX:
+        for k in [k for k, v in _user_cache.items() if v[0] <= now] or list(_user_cache):
+            _user_cache.pop(k, None)
+    _user_cache[str(user_id)] = (now + CURRENT_USER_TTL, current)
+
+
+def forget_current_user(user_id=None) -> None:
+    """Drop the remembered snapshot of one user, or of everyone (None)."""
+    if user_id is None:
+        _user_cache.clear()
+    else:
+        _user_cache.pop(str(user_id), None)
+
+
+from . import owner_cache as _owner_cache  # noqa: E402  (stdlib only, no cycle)
+_owner_cache.on_forget(forget_current_user)
 
 
 async def get_current_user_optional(request: Request) -> Optional[CurrentUser]:
@@ -131,7 +195,8 @@ async def get_current_user_optional(request: Request) -> Optional[CurrentUser]:
                 "call this endpoint. Use the MCP tools, or create an API key in the "
                 "dashboard for full API access."))
         async with database.session() as session:
-            return await _load_current_user(session, user_id)
+            return await _refuse_banned(session, user_id,
+                                        await _load_current_user(session, user_id))
 
     if not token:
         return None
@@ -143,8 +208,26 @@ async def get_current_user_optional(request: Request) -> Optional[CurrentUser]:
         user_id = uuid.UUID(payload["sub"])
     except Exception:
         return None
+    cacheable = _cacheable(request)
+    if cacheable:
+        hit = _cached_user(user_id)
+        if hit is not None:
+            return hit
     async with database.session() as session:
-        return await _load_current_user(session, user_id)
+        current = await _refuse_banned(session, user_id,
+                                       await _load_current_user(session, user_id))
+    if cacheable:
+        _remember_user(user_id, current)
+    return current
+
+
+async def _refuse_banned(session, user_id, current):
+    """Turn "nobody" into a 403 when the reason is a ban, so the client says
+    so instead of asking a signed-in user to sign in again. The row is already
+    in the session's identity map: no second query."""
+    if current is None and is_banned(await session.get(User, user_id)):
+        raise HTTPException(status_code=403, detail=SUSPENDED_DETAIL)
+    return current
 
 
 async def get_current_user_required(request: Request) -> CurrentUser:
@@ -292,6 +375,18 @@ async def purge_stale_magic_tokens():
                 delete(LoginCode).where(LoginCode.expires_at < _now() - timedelta(days=1)))
 
 
+async def lock_signup_email(session, email: str) -> None:
+    """Serialize sign-ins that may create the user for this email.
+
+    A brand-new address has no row to lock, so two near-simultaneous sign-ins
+    (a double-clicked Google consent, a reload of the callback, a magic link
+    opened next to a Google login) both saw "no user" and both INSERTed; the
+    loser hit users_email_key and answered 500. The transaction-scoped advisory
+    lock makes the second one wait, then find the first one's row.
+    """
+    await session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(email, 0))))
+
+
 @router.post("/api/auth/magic-link/verify")
 async def verify_magic_link(payload: MagicVerifyRequest, request: Request = None):
     token_hash = hashlib.sha256(payload.token.encode()).hexdigest()
@@ -306,6 +401,7 @@ async def verify_magic_link(payload: MagicVerifyRequest, request: Request = None
             row.used_at = _now()
             email = row.email.lower()
 
+            await lock_signup_email(session, email)
             user = (await session.execute(
                 select(User).where(User.email == email)
             )).scalar_one_or_none()
@@ -316,6 +412,8 @@ async def verify_magic_link(payload: MagicVerifyRequest, request: Request = None
                 session.add(user)
                 await session.flush()
             else:
+                if is_banned(user):
+                    raise HTTPException(status_code=403, detail=SUSPENDED_DETAIL)
                 user.last_login_at = _now()
             user_id, user_email = user.id, user.email
 
@@ -378,6 +476,8 @@ async def exchange_login_code(payload: LoginExchangeRequest):
             user = await session.get(User, row.user_id)
             if user is None:
                 raise bad
+            if is_banned(user):
+                raise HTTPException(status_code=403, detail=SUSPENDED_DETAIL)
             user_id, user_email = user.id, user.email
         token = issue_jwt(user_id, user_email)
         cu = await _load_current_user(session, user_id)
@@ -439,6 +539,8 @@ async def review_login(payload: ReviewLoginRequest, request: Request = None):
             )).scalar_one_or_none()
             if user is None:
                 raise HTTPException(status_code=401, detail="Wrong email or password.")
+            if is_banned(user):
+                raise HTTPException(status_code=403, detail=SUSPENDED_DETAIL)
             user.last_login_at = _now()
             user_id, user_email = user.id, user.email
         token = issue_jwt(user_id, user_email)

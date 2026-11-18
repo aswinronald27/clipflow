@@ -63,7 +63,8 @@ _IMAGE_FILE_BYTES = 32 * 1024 * 1024
 # never do. The worker has its own model key and needs no proxy, cookie or
 # storage secret: this host downloads the source and delivers the result.
 _OPTION_NAMES = frozenset({
-    "WATERMARK", "MAX_SOURCE_MINUTES", "SOURCE_CAP_MINUTES", "HOOK_LAZY"})
+    "WATERMARK", "MAX_SOURCE_MINUTES", "SOURCE_CAP_MINUTES", "HOOK_LAZY",
+    "CUT_MAX_FPS"})
 _OPTION_PREFIXES = ("AUTO_", "CLIP_")
 _OPTION_VALUE = re.compile(r"^[A-Za-z0-9 _.,:+-]{0,120}$")
 _FORMATS = frozenset({"auto", "vertical", "horizontal", "square"})
@@ -236,7 +237,9 @@ def set_ready(job_dir, source, rest, options):
         size = os.path.getsize(source)
     except OSError:
         return False
+    transcript = transcript_path(job_dir)
     data.update(state=READY, source=source, source_size=size,
+                transcript_size=os.path.getsize(transcript) if transcript else 0,
                 args=list(rest), env=dict(options), ready_at=time.time())
     write_json_atomic(os.path.join(job_dir, CLAIM_FILE), data)
     return True
@@ -343,9 +346,21 @@ def read_log(job_dir, offset):
     return [line for line in lines if line], offset + end + 1
 
 
-def mark_done(job_dir, returncode):
-    write_json_atomic(os.path.join(job_dir, DONE_FILE), {"returncode": int(returncode)})
+def mark_done(job_dir, returncode, stopping=False):
+    """``stopping``: the worker ended the job because it is being stopped or
+    restarted, not because the job failed. Such a job runs again and does not
+    count against the worker (``app._remote_outcome``)."""
+    write_json_atomic(os.path.join(job_dir, DONE_FILE),
+                      {"returncode": int(returncode), "stopping": bool(stopping)})
     touch_seen(job_dir)
+
+
+def read_stopping(job_dir) -> bool:
+    try:
+        with open(os.path.join(job_dir, DONE_FILE)) as f:
+            return json.load(f).get("stopping") is True
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
 
 
 def read_done(job_dir):
@@ -499,6 +514,71 @@ def finish_upload(job_dir, rel, size, claim, max_bytes=None, max_job_bytes=None)
     os.replace(tmp, target)
     touch_seen(job_dir)
     return target
+
+
+# --- What the worker is given besides the source ------------------------------
+
+# The transcript this host left for the job (main.py's own checkpoint file,
+# written by ``--prepare-only``): the worker puts it at the same place in its
+# job directory and its main.py reuses it like a resumed run does, instead of
+# transcribing on a CPU what this host's GPU does in seconds. A dotfile, so
+# the worker can read it and never write it back (``safe_relpath``).
+TRANSCRIPT_FILE = ".transcript_checkpoint.json"
+MAX_TRANSCRIPT_BYTES = _SMALL_FILE_BYTES
+MAX_TRANSCRIPT_SEGMENTS = 100_000
+
+
+def valid_transcript(payload) -> bool:
+    """The checkpoint's shape, checked on both sides of the wire: the source
+    it belongs to (a plain file name and a length) and a transcript with
+    segments. Only shape: main.py ties it to the source it actually has."""
+    if not isinstance(payload, dict):
+        return False
+    source, transcript = payload.get("source"), payload.get("transcript")
+    if not isinstance(source, dict) or not isinstance(transcript, dict):
+        return False
+    name, duration = source.get("name"), source.get("duration")
+    if (not isinstance(name, str) or not name or os.path.basename(name) != name
+            or isinstance(duration, bool) or not isinstance(duration, (int, float))):
+        return False
+    segments = transcript.get("segments")
+    return (isinstance(segments, list) and 0 < len(segments) <= MAX_TRANSCRIPT_SEGMENTS
+            and all(isinstance(seg, dict) for seg in segments))
+
+
+def transcript_path(job_dir):
+    """The job's prepared transcript if there is a usable one, else None."""
+    path = os.path.join(job_dir, TRANSCRIPT_FILE)
+    try:
+        if os.path.islink(path) or not os.path.isfile(path):
+            return None
+        if not 0 < os.path.getsize(path) <= MAX_TRANSCRIPT_BYTES:
+            return None
+    except OSError:
+        return None
+    return path
+
+
+def read_transcript(job_dir):
+    """The prepared transcript re-serialised as data, or None."""
+    path = transcript_path(job_dir)
+    if path is None:
+        return None
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not valid_transcript(payload):
+        return None
+    return json.dumps({"source": payload["source"], "transcript": payload["transcript"]})
+
+
+def drop_transcript(job_dir):
+    try:
+        os.remove(os.path.join(job_dir, TRANSCRIPT_FILE))
+    except OSError:
+        pass
 
 
 MAX_CLIPS = 60

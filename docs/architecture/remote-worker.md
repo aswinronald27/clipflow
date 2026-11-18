@@ -51,6 +51,12 @@ GPU admission counts, and `_jobs_busy_elsewhere` skips a job with a claim.
   the auto-retry runs it on this host. A retried job is never remote again
   (a job resumed after a deploy starts over and can be).
 - The download fails: the job fails as a local one would, with the same logs.
+- The worker is stopped or restarted (SIGTERM): it hands its running jobs back
+  with `stopping: true` (also the ones whose source this host is still
+  preparing, and the ones in the middle of the source transfer; the compose
+  file gives it `stop_grace_period` to do so), they are retried here like any
+  remote failure, and they do not count towards the breaker (`REMOTE_BREAKER_FAILURES` of the last
+  10 jobs failing parks the worker for `REMOTE_BREAKER_SECONDS`, 30 min).
 - The instance that dispatched the job is stopped before the worker ends: the
   manifest stays, the next instance resumes the job locally and
   `_register_resumed` clears the claim. The worker's next call gets `410` and
@@ -67,7 +73,10 @@ the API host.
   settings cross by name from a closed list (`remote_worker.allowed_option`:
   `WATERMARK`, the source caps, `AUTO_*`, `CLIP_*`), checked on both sides, and
   the command is `--format <choice>` or nothing (`worker_args`, `safe_args`).
-- It can read one thing: the source of a job it holds a live claim for.
+- It can read two things, both of a job it holds a live claim for: the source
+  and, when this host prepared one, the source's transcript
+  (`.../transcript`, see below). It can never write the transcript back: it
+  is a dotfile.
 - It can write only render outputs into that job's directory
   (`remote_worker.safe_relpath`): one plain file name with a known extension,
   no subdirectory, no link, **no dotfile**, and never a file that was there
@@ -121,7 +130,18 @@ worker only.
 API: `REMOTE_WORKER_TOKEN` (32+ random characters), `REMOTE_WORKER_SLOTS` (jobs
 it may hold at once), `REMOTE_LEASE_SECONDS`, `REMOTE_MAX_SECONDS`,
 `REMOTE_MAX_FILE_MB`, `REMOTE_MAX_JOB_MB`, `REMOTE_BREAKER_FAILURES`,
-`REMOTE_BREAKER_SECONDS`.
+`REMOTE_BREAKER_SECONDS`, `REMOTE_QUIET_MINUTES` (minutes of the hour, UTC,
+like `55-5`, with no new claim: when the worker's host shares its link with
+something that peaks at fixed times), `REMOTE_SOURCE_MBPS` (cap for all source
+transfers together, 0 for none), `PREPARE_TRANSCRIPT` (`1`, `cache` or unset:
+whether the source's transcript is prepared for the worker).
+
+The source download is the worker's one long call: the API touches the lease
+while it streams the file (`_source_chunks`), so a slow transfer is not taken
+for a dead worker. Before that, a ~1 GB source from a busy host outlived
+`REMOTE_LEASE_SECONDS`, the job came back mid-transfer and four of those
+tripped the breaker, leaving the worker idle exactly when the API host was
+short of CPU.
 
 Worker: `WORKER_API_URL` (https), `WORKER_TOKEN`, `WORKER_SLOTS`,
 `GEMINI_API_KEY`, plus the pipeline defaults the API host sets for itself
@@ -131,3 +151,34 @@ per-job options travel with a job.
 On a CPU each job costs several times the CPU of a GPU job. Size
 `WORKER_SLOTS` by cores (a job keeps about eight busy), and keep
 `REMOTE_WORKER_SLOTS` equal to it.
+
+What limits a CPU worker is rarely its slots:
+
+- **Transcription.** On a CPU the transcript is the largest single cost of a
+  job and about half of its wall time. With `PREPARE_TRANSCRIPT` set on the
+  API host, `main.py --prepare-only` leaves the transcript in the job
+  directory as main.py's own checkpoint (`.transcript_checkpoint.json`):
+  `cache` takes only what the download cache holds for that very source, `1`
+  otherwise transcribes there, on the card, inside the same `ASR_HOST_SLOTS`
+  as any job, and only if a slot frees up within `PREPARE_TRANSCRIPT_WAIT`
+  seconds (45): when the card's own jobs keep them busy the worker
+  transcribes for itself, so neither host waits for the other. The claim then announces `transcript_size`, the worker fetches
+  it (`GET .../transcript`, re-serialised as data and shape-checked on both
+  sides, `remote_worker.valid_transcript`), puts it at the same place in its
+  own job directory and its main.py reuses it exactly like a resumed run.
+  Anything wrong with it and the worker transcribes as before. A remote run
+  that fails leaves the checkpoint for the retry on the API host; a completed
+  one removes it. Watch `asr_wait_s` in the API host's `[job-cpu]` lines: the
+  prepared transcripts share its transcription turns.
+- **Transcription turns.** `ASR_HOST_SLOTS` (default 2) is sized for a GPU's
+  memory. On a CPU host a transcription takes minutes, so with 2 turns most
+  slots sit waiting for one (the job's `asr_wait_s`). Raise it on a CPU host
+  with cores to spare, and cap the math libraries' threads per process
+  (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`) so parallel
+  transcriptions do not each start one thread per core.
+- **Process limit.** Each job runs about two hundred threads; a container
+  `pids_limit` below slots x 250 makes ffmpeg fail to start threads and a job
+  hang or die.
+- **Encoder effort.** Most of a CPU job is libx264. `X264_PRESET` (for example
+  `veryfast`) replaces every tier's preset at the same CRF: less CPU per clip
+  for a somewhat larger file. Leave it unset on a GPU host.

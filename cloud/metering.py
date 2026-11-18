@@ -99,7 +99,7 @@ _CONTENT_HINTS = (
     "join this channel", "not available on this app", "is not a valid url",
     "unsupported url", "no video formats found", "premieres in", "will begin in",
     "this live event", "no duration in metadata", "requested format is not available",
-    "account has been terminated", "video is age", "confirm your age",
+    "account has been terminated", "video is age", "confirm your age", "age-restricted",
     # An uploader's country block: the residential pool exits from the same
     # blocked countries, so the paid probe failed with the identical error in
     # 5 of the 6 cases between 3-sep and 5-sep-2026 (3.6 MB each, and the
@@ -200,6 +200,17 @@ def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     if reason:
         raise NotASingleVideo(f"This link is {reason}.")
 
+    # A YouTube video probed in the last hours (the download cache keeps its
+    # length): a video's length does not change, and asking again would spend
+    # a request of a YouTube account for an answer we already have.
+    import source_cache
+    known = source_cache.probe_get(url)
+    if known:
+        if known.get("max_height"):
+            _probe_facts[url] = {"at": time.time(), "max_height": int(known["max_height"]),
+                                 "duration": int(known["seconds"])}
+        return known["seconds"] / 60.0
+
     bgutil_http = os.environ.get("BGUTIL_BASE_URL", "").strip()
     bgutil_script = os.environ.get("BGUTIL_SCRIPT_PATH", "").strip()
     # Same client lists as the download (yt_clients.py): the authed defaults
@@ -249,10 +260,97 @@ def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     # One of the configured accounts (yt_account.Session), as a private file.
     session = yt_account.Session()
     try:
-        return _probe_with_proxies(url, proxies, strategies, static_errors,
-                                   paid, session.path)
+        minutes = _probe_with_proxies(url, proxies, strategies, static_errors,
+                                      paid, session.path)
     finally:
         session.close()
+    facts = _probe_facts.get(url) or {}
+    source_cache.probe_put(url, minutes * 60.0, facts.get("max_height"))
+    return minutes
+
+
+# --- The probe in its own process -------------------------------------------
+# yt-dlp is pure Python: a probe holds the GIL for about a second of CPU, and
+# the API is one process whose event loop needs the same GIL. At 30-50 probes
+# a minute (16-nov) the loop got too little of it, DB connections stayed
+# checked out and every endpoint answered 500 for minutes. In a pool of
+# processes the probes use other cores and leave the loop alone. What a probe
+# leaves behind in this module (quality facts, the static-pool verdict, paid
+# proxy events) comes back with its result; the YouTube accounts' budget is
+# already shared through files (yt_account). PROBE_PROCESSES=0: in a thread.
+# Sized for waiting, not for CPU: a probe spends most of its time asleep on
+# the YouTube account's turn (yt_account, up to YT_ACCOUNT_MAX_WAIT), and four
+# processes asleep queued every other probe behind them (16-nov: estimate p50
+# 45 s). ~150 MB each, started on demand.
+PROBE_PROCESSES = max(0, int(os.environ.get("PROBE_PROCESSES", "12") or 0))
+PROBE_TASKS_PER_CHILD = 200
+_probe_pool = None
+
+
+def _probe_in_child(url, allow_paid):
+    """Runs in a pool process: the probe and what it left in this module."""
+    from yt_clients import NotASingleVideo
+    out = {"minutes": None, "error": None, "single": False}
+    try:
+        out["minutes"] = probe_url_minutes(url, allow_paid=allow_paid)
+    except NotASingleVideo as e:
+        out["error"], out["single"] = str(e), True
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"[:500]
+    out["facts"] = _probe_facts.get(url)
+    out["bot_checked"] = pop_statics_bot_checked(url)
+    out["events"] = pop_paid_probe_events()
+    return out
+
+
+def _merge_child_probe(url, out):
+    if out.get("facts"):
+        now = time.time()
+        for k in [k for k, v in _probe_facts.items() if now - v["at"] > _PROBE_FACTS_TTL]:
+            _probe_facts.pop(k, None)
+        _probe_facts[url] = out["facts"]
+    if out.get("bot_checked"):
+        _static_bot_verdicts.add(url)
+    _paid_probe_events.extend(out.get("events") or [])
+    if out.get("error") is not None:
+        if out.get("single"):
+            from yt_clients import NotASingleVideo
+            raise NotASingleVideo(out["error"])
+        raise ValueError(out["error"])
+    return out["minutes"]
+
+
+def _get_probe_pool():
+    global _probe_pool
+    if _probe_pool is None:
+        import concurrent.futures
+        import multiprocessing
+        # spawn, not fork: the API process has threads and an event loop.
+        _probe_pool = concurrent.futures.ProcessPoolExecutor(
+            max_workers=PROBE_PROCESSES, mp_context=multiprocessing.get_context("spawn"),
+            max_tasks_per_child=PROBE_TASKS_PER_CHILD)
+    return _probe_pool
+
+
+async def run_probe(url: str, allow_paid: bool = True) -> float:
+    """``probe_url_minutes`` off the event loop and, with PROBE_PROCESSES, off
+    this process's GIL."""
+    import functools
+    loop = asyncio.get_running_loop()
+    if PROBE_PROCESSES:
+        global _probe_pool
+        try:
+            out = await loop.run_in_executor(_get_probe_pool(), _probe_in_child, url, allow_paid)
+        except Exception as e:
+            from concurrent.futures.process import BrokenProcessPool
+            if not isinstance(e, BrokenProcessPool):
+                raise
+            print(f"⚠️ Probe pool broke ({e}); this probe runs in a thread.")
+            _probe_pool = None
+        else:
+            return _merge_child_probe(url, out)
+    return await loop.run_in_executor(
+        None, functools.partial(probe_url_minutes, url, allow_paid=allow_paid))
 
 
 # What the last probes learned about each URL, for the quality gate that runs
@@ -400,6 +498,8 @@ def _probe_with_proxies(url, proxies, strategies, static_errors, paid, ck_path):
                 route_errors.append(str(e)[:300])
                 if authed and yt_account.is_rate_limit(str(e)):
                     session.limited()   # moves to another account if one is awake
+                elif authed and yt_account.is_age_gate(str(e)):
+                    session.age_gated()  # an age-verified account may open it
         else:
             if not is_paid:
                 static_errors[_route_name(proxy, proxies)] = (

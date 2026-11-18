@@ -6,6 +6,7 @@ import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
 import DownloadProgressBar from './components/DownloadProgressBar';
+import { clipProgress, FREE_CLIPS_PER_VIDEO, FREE_CLIPS_QUIET, MAX_CLIPS_PER_VIDEO } from './lib/clipProgress';
 // import Gallery from './components/Gallery';
 import ThumbnailStudio from './components/ThumbnailStudio';
 import SaaShortsTab from './components/SaaShortsTab';
@@ -32,6 +33,7 @@ import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
 import { useAuth } from './contexts/AuthContext';
 import { apiFetch, apiJson, QuotaError, QUOTA_WALL_EVENT } from './lib/api';
+import { SOCIAL_PLATFORMS } from './lib/socialPlatforms';
 import { track } from './lib/analytics';
 import { readConnectReturn, stripConnectReturn } from './lib/connectReturn';
 import { rememberTabAfterLogin } from './lib/tabAfterLogin';
@@ -144,6 +146,9 @@ const formatRetention = (seconds) => {
   return `${Math.max(1, Math.round(seconds / 60))} min`;
 };
 
+// TikTok, Instagram and YouTube have their own icons above; the rest come from the shared list.
+const EXTRA_NETWORKS = SOCIAL_PLATFORMS.slice(3);
+
 const ProfileNetworkIcons = ({ profile, size = 12 }) => (
   <span className="flex items-center gap-1.5">
     <span className={profile?.connected?.includes('tiktok') ? 'text-ink' : 'text-muted opacity-40'}>
@@ -155,6 +160,11 @@ const ProfileNetworkIcons = ({ profile, size = 12 }) => (
     <span className={profile?.connected?.includes('youtube') ? 'text-ink' : 'text-muted opacity-40'}>
       <Youtube size={size} />
     </span>
+    {EXTRA_NETWORKS.map((p) => (
+      <span key={p.value} className={profile?.connected?.includes(p.value) ? 'text-ink' : 'text-muted opacity-40'}>
+        <p.Icon size={size} />
+      </span>
+    ))}
   </span>
 );
 
@@ -221,6 +231,11 @@ const UserProfileSelector = ({ profiles, selectedUserId, onSelect, onConnect }) 
                       <div className={`flex items-center gap-1 ${profile.connected.includes('youtube') ? 'text-ink2' : 'text-muted opacity-40'}`}>
                         <Youtube size={10} />
                       </div>
+                      {EXTRA_NETWORKS.map((p) => (
+                        <div key={p.value} className={`flex items-center gap-1 ${profile.connected.includes(p.value) ? 'text-ink2' : 'text-muted opacity-40'}`}>
+                          <p.Icon size={10} />
+                        </div>
+                      ))}
                     </div>
                   </div>
                 </div>
@@ -389,6 +404,10 @@ function App() {
   const [downloadProgress, setDownloadProgress] = useState(null);
   const [cancellingJob, setCancellingJob] = useState(false);
   const logsContainerRef = useRef(null);
+  // Clips picked and finished so far, read from the running job's log, so the
+  // results panel can say "3/5" instead of an open-ended wait.
+  const progress = useMemo(() => clipProgress(logs), [logs]);
+  const clipsMaking = status === 'processing' && progress.total > 0;
   // Collapsed on phones: the log tail is the least useful thing on a 360px
   // screen and it was pushing the actual clips a full scroll down.
   const [logsVisible, setLogsVisible] = useState(() => {
@@ -589,6 +608,7 @@ function App() {
         start: data.start,
         end: data.end,
         recipe: data.recipe,
+        mode: data.mode ?? clips[index].mode,
       };
       return { ...prev, clips };
     });
@@ -612,6 +632,38 @@ function App() {
     handleClipStateChange(index, { activeLayers: null, serverVideoFile: newFile });
   };
 
+  // Whether a job's source video can still be played (a paid job's is kept in
+  // storage for a while; older ones and the free plan's are gone). Asked of a
+  // player of its own: playing it is the only honest test, and a missing
+  // source must leave the panel as it was, not a dead player.
+  const sourcePlayable = async (id) => {
+    try {
+      const res = await apiFetch(`/api/source-url/${id}`);
+      if (!res.ok) return false;
+      const { url } = await res.json();
+      if (!url) return false;
+      return await new Promise((resolve) => {
+        const probe = document.createElement('video');
+        let settled = false;
+        const done = (ok) => {
+          if (settled) return;
+          settled = true;
+          probe.removeAttribute('src');
+          probe.load();
+          resolve(ok);
+        };
+        probe.preload = 'metadata';
+        probe.muted = true;
+        probe.onloadedmetadata = () => done(true);
+        probe.onerror = () => done(false);
+        setTimeout(() => done(false), 15000);
+        probe.src = getApiUrl(url);
+      });
+    } catch {
+      return false;
+    }
+  };
+
   // Reopen an archived project from the History tab: the backend re-downloads
   // its files from R2 into the server's working dir and returns the full state.
   const restoreProject = async (projectJobId) => {
@@ -628,6 +680,13 @@ function App() {
     setQualityGate(null);
     setStatus('complete');
     setActiveTab('dashboard');
+    // The long video comes back next to the clips when it is still there, so
+    // a clip can be checked against it before lengthening or trimming it.
+    sourcePlayable(data.job_id).then((ok) => {
+      if (!ok || jobIdRef.current !== data.job_id) return;
+      setNoSource(false);
+      setProcessingMedia({ type: 'server', payload: `/api/source/${data.job_id}` });
+    });
   };
 
   // Apply one subtitle style to every clip of the job, sequentially.
@@ -846,10 +905,30 @@ function App() {
   const handleResetRef = useRef(null);
 
   useEffect(() => {
-    let interval;
+    let timer;
+    let stopped = false;
     let failures = 0;
-    if ((status === 'processing' || status === 'completed') && jobId) {
-      interval = setInterval(async () => {
+    // One poll at a time (the next is scheduled when this one answers, so a
+    // slow server never gets a pile of them), and at the pace the job needs:
+    // every 2 s while it renders, 5 s while it waits in the queue, 15 s in a
+    // tab nobody is looking at.
+    let nextDelay = 2000;
+    let inFlight = false;
+    const stop = () => { stopped = true; clearTimeout(timer); };
+    const schedule = () => {
+      if (stopped) return;
+      const delay = (typeof document !== 'undefined' && document.hidden) ? 15000 : nextDelay;
+      timer = setTimeout(tick, delay);
+    };
+    const onVisible = () => {
+      if (!stopped && !inFlight && typeof document !== 'undefined' && !document.hidden) {
+        clearTimeout(timer);
+        timer = setTimeout(tick, 0);
+      }
+    };
+    const tick = async () => {
+        if (stopped || inFlight) return;
+        inFlight = true;
         try {
           const data = await pollJob(jobId);
           failures = 0;
@@ -865,12 +944,15 @@ function App() {
           if (data.download_progress) {
             setDownloadProgress(data.download_progress);
           }
+          nextDelay = data.status === 'queued'
+            ? 5000
+            : (data.download_progress && data.download_progress.status !== 'done' ? 1000 : 2000);
 
           if (data.status === 'completed') {
             setQueueInfo(null);
             setDownloadProgress(null);
             setStatus('complete');
-            clearInterval(interval);
+            stop();
             refreshMe();
           } else if (data.status === 'cancelled') {
             setQueueInfo(null);
@@ -881,7 +963,7 @@ function App() {
               setLogs(data.logs);
               setLogTimes(data.log_times || []);
             }
-            clearInterval(interval);
+            stop();
             refreshMe();
           } else if (data.status === 'failed') {
             setStatus('error');
@@ -889,7 +971,7 @@ function App() {
             const errorMsg = data.error || (data.logs && data.logs.length > 0 ? data.logs[data.logs.length - 1] : "Process failed");
             setJobError(readableError(errorMsg));
             setLogs(prev => [...prev, "Error: " + errorMsg]);
-            clearInterval(interval);
+            stop();
             refreshMe();
           } else {
             // Update logs if available
@@ -902,7 +984,7 @@ function App() {
           console.error("Polling error", e);
           failures += 1;
           if (pollFailureAction(e, failures) === 'gone') {
-            clearInterval(interval);
+            stop();
             // Back to idle (which drops the saved session) and on to History,
             // where a finished job's clips are kept.
             handleResetRef.current();
@@ -911,9 +993,17 @@ function App() {
             if (historyAvailableRef.current) setActiveTab('history');
           }
         }
-      }, 1000);
+        inFlight = false;
+        schedule();
+    };
+    if ((status === 'processing' || status === 'completed') && jobId) {
+      document.addEventListener('visibilitychange', onVisible);
+      timer = setTimeout(tick, 1000);
     }
-    return () => clearInterval(interval);
+    return () => {
+      stop();
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [status, jobId, refreshMe]);
 
 
@@ -2474,7 +2564,11 @@ function App() {
                 <div className="mb-4 sm:mb-6 shrink-0 space-y-3">
                   <h2 className="font-display lowercase text-lg sm:text-xl text-ink flex flex-wrap items-center gap-2">
                     <span className="mr-auto">Generated Shorts</span>
-                    {results?.clips?.length > 0 && (
+                    {clipsMaking ? (
+                      <span className="readout bg-paper3 px-2.5 py-1 rounded-full text-brass">
+                        {progress.ready}/{progress.total} Clips
+                      </span>
+                    ) : results?.clips?.length > 0 && (
                       <span className="readout bg-paper3 px-2.5 py-1 rounded-full">
                         {results.clips.length} Clips
                       </span>
@@ -2485,6 +2579,18 @@ function App() {
                       </span>
                     )}
                   </h2>
+                  {clipsMaking && (
+                    <div
+                      className="h-1 rounded-full bg-paper3 overflow-hidden"
+                      role="progressbar" aria-valuemin={0} aria-valuemax={progress.total} aria-valuenow={progress.ready}
+                      aria-label="Clips ready"
+                    >
+                      <div
+                        className="h-full bg-brass transition-all duration-500"
+                        style={{ width: `${(progress.ready / progress.total) * 100}%` }}
+                      />
+                    </div>
+                  )}
                   {results?.clips?.length > 0 && status === 'complete' && (
                     <div className="flex flex-col sm:flex-row sm:justify-end items-stretch sm:items-center gap-2">
                       <button
@@ -2540,9 +2646,19 @@ function App() {
                         onClick={() => openUpsell({ source: 'results_banner' })}
                         className="w-full text-left px-3 py-2.5 rounded-input bg-paper3 border border-brass/40 hover:border-brass text-sm transition-colors"
                       >
-                        <span className="text-ink">Like these clips?</span>{' '}
-                        <span className="text-muted">Upgrade and these exact clips lose the watermark on the spot, and stay for good.</span>{' '}
-                        <span className="text-brass font-medium">Remove the watermark →</span>
+                        <span className="text-ink">
+                          {results?.clips?.length <= FREE_CLIPS_QUIET
+                            ? `The free plan makes the ${FREE_CLIPS_PER_VIDEO} to ${FREE_CLIPS_QUIET} best clips of each video.`
+                            : 'Like these clips?'}
+                        </span>{' '}
+                        <span className="text-muted">
+                          {results?.clips?.length <= FREE_CLIPS_QUIET
+                            ? `Plans get every clip, up to ${MAX_CLIPS_PER_VIDEO} per video, and these lose the watermark on the spot.`
+                            : 'Upgrade and these exact clips lose the watermark on the spot, and stay for good.'}
+                        </span>{' '}
+                        <span className="text-brass font-medium">
+                          {results?.clips?.length <= FREE_CLIPS_QUIET ? 'Get every clip →' : 'Remove the watermark →'}
+                        </span>
                       </button>
                     )}
                     {showAutopilotNudge && (
@@ -2644,6 +2760,7 @@ function App() {
                           jobId={jobId}
                           onEditClip={(index) => setEditingClip(index)}
                           onReframeClip={(index) => setReframingClip(index)}
+                          onModeChanged={status === 'processing' ? null : handleClipRerendered}
                           onUpgrade={isManaged ? openUpsell : null}
                           initialState={projectState?.clips?.find((c) => c.index === i) || null}
                           onStateChange={handleClipStateChange}
@@ -2667,7 +2784,9 @@ function App() {
                     status === 'processing' ? (
                       <div className="h-full min-h-[140px] flex flex-col items-center justify-center text-muted space-y-3 text-center px-4">
                         <Loader2 size={28} className="animate-spin text-brass" />
-                        <p className="text-sm lowercase">Waiting for clips...</p>
+                        <p className="text-sm lowercase">
+                          {clipsMaking ? `Making ${progress.total} ${progress.total === 1 ? 'clip' : 'clips'}...` : 'Waiting for clips...'}
+                        </p>
                         <p className="text-xs text-muted/80 max-w-[26ch] leading-snug">
                           They appear here one by one as each finishes rendering.
                         </p>

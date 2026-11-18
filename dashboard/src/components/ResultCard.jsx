@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp } from 'lucide-react';
+import { Download, Share2, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp, Sparkles } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
+import { platformOptions as buildPlatformOptions, defaultPlatformFlags, flagsFromList } from '../lib/socialPlatforms';
 import { track } from '../lib/analytics';
 import SubtitleModal from './SubtitleModal';
 import HookModal from './HookModal';
@@ -41,11 +42,7 @@ async function followPost(requestId, tries = 12, everyMs = 5000) {
     return { done: false, failed: [] };
 }
 
-const PLATFORM_OPTIONS = [
-    { value: 'tiktok', label: 'tiktok', icon: <Video size={16} /> },
-    { value: 'instagram', label: 'instagram', icon: <Instagram size={16} /> },
-    { value: 'youtube', label: 'youtube', icon: <Youtube size={16} /> },
-];
+const PLATFORM_OPTIONS = buildPlatformOptions({ lower: true });
 
 function clipDurationSeconds(clip) {
     // A recut clip's start/end are the covering source range (segments may be
@@ -63,7 +60,7 @@ function formatDuration(clip) {
     return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
 }
 
-export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null, onUpgrade = null }) {
+export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null, onModeChanged = null, onUpgrade = null }) {
     const [showModal, setShowModal] = useState(false);
     // The "why" line is clamped to two lines so cards in a row stay level;
     // when it overflows, a hover (desktop) or tap (touch) shows the whole
@@ -123,10 +120,38 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     // button. Stream it instead and report progress.
     const [downloadPct, setDownloadPct] = useState(null);
 
+    // Where a download pulls its bytes from: the archived copy when storage
+    // holds exactly this file (the API is one busy process, and a clip through
+    // it was slow), else the API as before. A preview rendered in this tab
+    // (blob:) and anything the server does not vouch for stay as they were.
+    const downloadSource = async () => {
+        const local = String(currentVideoUrl || '');
+        const match = /\/videos\/[^/]+\/([^/?#]+)/.exec(local);
+        if (!isManaged || !jobId || local.startsWith('blob:') || !match) return null;
+        try {
+            const res = await apiFetch(
+                `/api/media-url?job_id=${encodeURIComponent(jobId)}&filename=${encodeURIComponent(decodeURIComponent(match[1]))}`);
+            if (!res.ok) return null;
+            return (await res.json()).url || null;
+        } catch {
+            return null;
+        }
+    };
+
     const downloadClip = async () => {
         try {
             setDownloadPct(0);
-            const response = await fetch(currentVideoUrl);
+            let response = null;
+            const archived = await downloadSource();
+            if (archived) {
+                try {
+                    response = await fetch(archived);
+                    if (!response.ok) response = null;
+                } catch {
+                    response = null;
+                }
+            }
+            if (!response) response = await fetch(currentVideoUrl);
             if (!response.ok) throw new Error('Download failed');
             const total = Number(response.headers.get('content-length')) || 0;
             let blob;
@@ -156,6 +181,9 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
             a.click();
             window.URL.revokeObjectURL(url);
             document.body.removeChild(a);
+            track('ClipDownloaded', { props: {
+                surface: 'results', clip_index: index, clips: clipCount,
+                score: Number.isFinite(clip.predicted_score) ? clip.predicted_score : undefined } });
         } catch (err) {
             console.error('Download error:', err);
             window.open(currentVideoUrl, '_blank');
@@ -210,11 +238,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [clip.video_url]);
 
-    const [platforms, setPlatforms] = useState({
-        tiktok: true,
-        instagram: true,
-        youtube: true
-    });
+    const [platforms, setPlatforms] = useState(defaultPlatformFlags);
     const [postTitle, setPostTitle] = useState("");
     const [postDescription, setPostDescription] = useState("");
     const [isScheduling, setIsScheduling] = useState(false);
@@ -241,6 +265,46 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     const [showHookModal, setShowHookModal] = useState(false);
     const [showTranslateModal, setShowTranslateModal] = useState(false);
     const [editError, setEditError] = useState(null);
+
+    // Pro mode: the talking-head re-edit (tighter frame on the face, dead air
+    // cut, graded picture). The server renders a new file both ways, so the
+    // card remounts from it exactly like after a recut.
+    const isPro = clip.mode === 'pro';
+    const [isSwitchingMode, setIsSwitchingMode] = useState(false);
+    // Pro mode frames a face in a vertical clip: on a horizontal or square
+    // one the server refuses, so the switch is not offered there. Unknown
+    // until the video's metadata loads, and offered meanwhile.
+    const [isUpright, setIsUpright] = useState(true);
+    const canSwitchMode = Boolean(onModeChanged) && (isUpright || isPro);
+    const handleMode = async () => {
+        setIsSwitchingMode(true);
+        setEditError(null);
+        try {
+            const res = await apiFetch('/api/clip/mode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    job_id: jobId,
+                    clip_index: index,
+                    mode: isPro ? 'normal' : 'pro',
+                    input_filename: serverVideoFile,
+                }),
+            });
+            if (!res.ok) {
+                let detail = '';
+                try { detail = (await res.json()).detail; } catch { /* not JSON */ }
+                throw new Error(typeof detail === 'string' && detail ? detail : 'Could not switch the clip mode.');
+            }
+            const data = await res.json();
+            track('ClipModeSwitched', { props: { mode: data.mode } });
+            if (onModeChanged && data.new_video_url) onModeChanged(index, data);
+        } catch (e) {
+            setEditError(e.message);
+            setTimeout(() => setEditError(null), 6000);
+        } finally {
+            setIsSwitchingMode(false);
+        }
+    };
 
     const [clipDuration, setClipDuration] = useState(() => {
         const secs = clipDurationSeconds(clip);
@@ -306,11 +370,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
             setPostResult(null);
             // Only preselect platforms the profile can actually publish to.
             if (knownConnections) {
-                setPlatforms({
-                    tiktok: connectedPlatforms.includes('tiktok'),
-                    instagram: connectedPlatforms.includes('instagram'),
-                    youtube: connectedPlatforms.includes('youtube'),
-                });
+                setPlatforms(flagsFromList(connectedPlatforms));
             }
         }
         // Reset only when the modal opens for a clip; connection changes while
@@ -803,7 +863,10 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     className="w-full h-full object-contain"
                     playsInline
                     onLoadedMetadata={(e) => {
-                        if (e.target.videoWidth) setResolution(`${e.target.videoWidth}×${e.target.videoHeight}`);
+                        if (e.target.videoWidth) {
+                            setResolution(`${e.target.videoWidth}×${e.target.videoHeight}`);
+                            setIsUpright(e.target.videoHeight > e.target.videoWidth);
+                        }
                     }}
                     onError={() => {
                         // The durable copy is unreachable (signature expired after an
@@ -820,6 +883,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         else setVideoErrored(true);
                     }}
                     onPlay={() => {
+                        if (!hasPlayed) track('ClipPlayed', { props: { clip_index: index, clips: clipCount } });
                         setHasPlayed(true);
                         const currentTime = videoRef.current ? videoRef.current.currentTime : 0;
                         onPlay && onPlay(clip.start + currentTime);
@@ -906,6 +970,8 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     <div className="flex flex-wrap gap-1.5">
                         {durationReadout && <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0">{durationReadout}</span>}
                         {resolution && <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0">{resolution}</span>}
+                        {isPro && <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0 text-brass">pro mode</span>}
+                        {!isPro && clip.pro_suggested && <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0 text-brass">pro recommended</span>}
                         <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0">#shorts</span>
                         <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0">#viral</span>
                     </div>
@@ -957,6 +1023,33 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     </div>
                 )}
 
+                {canSwitchMode && !isPro && clip.pro_suggested && (
+                    <button
+                        onClick={handleMode}
+                        disabled={isSwitchingMode}
+                        className="mb-3 w-full flex items-center gap-3 px-3 py-2.5 rounded-input border border-brass bg-brass/10 hover:bg-brass/20 text-left transition-colors disabled:opacity-70"
+                    >
+                        {isSwitchingMode
+                            ? <Loader2 size={20} className="animate-spin text-brass shrink-0" />
+                            : <Sparkles size={20} className="text-brass shrink-0" />}
+                        <span className="min-w-0">
+                            <span className="block text-sm font-semibold text-ink">
+                                {isSwitchingMode ? 'Rendering pro mode…' : 'Try pro mode on this clip'}
+                            </span>
+                            <span className="block text-[11px] leading-snug text-ink2">
+                                One person talking: tighter frame on the face, pauses cut, cinematic look. One click back to normal.
+                            </span>
+                        </span>
+                    </button>
+                )}
+                {canSwitchMode && (isPro || !clip.pro_suggested) && (
+                    <p className="mb-2 text-[11px] leading-snug text-muted">
+                        {isPro
+                            ? 'Pro mode is on: tighter frame on the face, pauses cut, cinematic look. You can switch back to normal any time.'
+                            : 'Pro mode is recommended only for podcasts and talking-head clips, where the picture is one person speaking.'}
+                    </p>
+                )}
+
                 {/* Actions Footer */}
                 <div className="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2 mt-auto pt-4 border-t border-rule">
                     {onEditClip && (
@@ -976,6 +1069,22 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         >
                             <Crosshair size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
                             reframing
+                        </button>
+                    )}
+
+                    {canSwitchMode && (
+                        <button
+                            onClick={handleMode}
+                            disabled={isSwitchingMode}
+                            title="Pro mode: tighter frame on the face, pauses cut, cinematic look. Recommended for podcasts and talking-head clips."
+                            className={!isPro && clip.pro_suggested
+                                ? 'btn-primary flex-col gap-1 py-2.5 sm:py-2 px-1 text-[11px] leading-none rounded-input whitespace-nowrap'
+                                : QUIET_BTN}
+                        >
+                            {isSwitchingMode
+                                ? <Loader2 size={16} className={`animate-spin shrink-0 ${!isPro && clip.pro_suggested ? '' : 'text-brass'}`} />
+                                : <Sparkles size={16} className={!isPro && clip.pro_suggested ? 'shrink-0' : `${isPro ? 'text-brass' : 'text-muted'} group-hover:text-brass transition-colors shrink-0`} />}
+                            {isSwitchingMode ? 'rendering…' : isPro ? 'normal mode' : 'pro mode'}
                         </button>
                     )}
 
@@ -1116,7 +1225,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 {noAccountsConnected && (
                     <div className="mb-4 px-3 py-2 rounded-input text-xs text-warn bg-[color-mix(in_oklab,var(--color-warn)_10%,transparent)] flex items-start gap-2">
                         <AlertCircle size={14} className="mt-0.5 shrink-0" />
-                        <div className="lowercase">no social accounts connected yet — link tiktok, instagram or youtube to publish this clip.</div>
+                        <div className="lowercase">no social accounts connected yet — link tiktok, instagram, youtube, facebook, linkedin, threads or bluesky to publish this clip.</div>
                     </div>
                 )}
 
@@ -1181,14 +1290,10 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         <label className="eyebrow block mb-2">PLATFORMS</label>
                         <SegmentedControl
                             multi
-                            columns={3}
+                            columns={4}
                             options={platformOptions}
                             value={Object.keys(platforms).filter(k => platforms[k])}
-                            onChange={(arr) => setPlatforms({
-                                tiktok: arr.includes('tiktok'),
-                                instagram: arr.includes('instagram'),
-                                youtube: arr.includes('youtube'),
-                            })}
+                            onChange={(arr) => setPlatforms(flagsFromList(arr))}
                         />
                     </div>
 

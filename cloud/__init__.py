@@ -22,12 +22,17 @@ def setup_sync(app):
     """
     validate_required()
 
+    # Ship this process's log to private storage (off unless LOG_ARCHIVE_BUCKET).
+    from . import log_archive
+    log_archive.install()
+
     # SessionMiddleware backs the OAuth state handshake.
     from starlette.middleware.sessions import SessionMiddleware
     app.add_middleware(SessionMiddleware, secret_key=settings.jwt_secret)
 
     from . import (auth, oauth, billing, social_profiles, videos, api_keys,
-                   account, mcp_oauth, marketing, autopilot, lifecycle, cancellation, onboarding)  # noqa: F401
+                   account, mcp_oauth, marketing, autopilot, lifecycle, cancellation,  # noqa: F401
+                   onboarding, support_ops)
     oauth.register()
     billing._init_stripe()
     app.include_router(auth.router)
@@ -47,6 +52,14 @@ def setup_sync(app):
     # Unsubscribe from commercial email (LSSI art. 21.2): the out-of-minutes
     # upsell and the lifecycle emails (cloud/lifecycle.py).
     app.include_router(marketing.router)
+    # Support back-office API (cloud/support_ops.py): 404 everywhere unless
+    # its keys are set; no UI, no OpenAPI entry, no CORS.
+    support_ops.load_keys()
+    app.include_router(support_ops.router)
+    # What people do with their clips (edit tools, social post, zip download),
+    # reported server-side to product analytics (cloud/usage_events.py).
+    from .usage_events import UsageEventsMiddleware
+    app.add_middleware(UsageEventsMiddleware)
 
 
 async def setup_async(app, keep_reservation_ids=None, live_reservation_ids=None,
