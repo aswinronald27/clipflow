@@ -403,6 +403,7 @@ function App() {
   // Live yt-dlp download progress (percent, bytes, speed, eta, phase), from /api/status.
   const [downloadProgress, setDownloadProgress] = useState(null);
   const [cancellingJob, setCancellingJob] = useState(false);
+  const [retryingJob, setRetryingJob] = useState(false);
   const logsContainerRef = useRef(null);
   // Clips picked and finished so far, read from the running job's log, so the
   // results panel can say "3/5" instead of an open-ended wait.
@@ -1480,6 +1481,54 @@ function App() {
     }
   };
 
+  const handleRetryJob = async (targetJobId = jobId) => {
+    if (!targetJobId || retryingJob) return null;
+    setRetryingJob(true);
+    try {
+      const headers = {};
+      if (apiKey) headers['X-Gemini-Key'] = apiKey;
+      const res = await apiFetch(`/api/jobs/${targetJobId}/retry`, {
+        method: 'POST',
+        headers,
+      });
+      if (!res.ok) {
+        let detail = 'Could not retry this job.';
+        try {
+          const body = await res.json();
+          if (body?.detail) detail = String(body.detail);
+        } catch { /* ignore */ }
+        if (targetJobId === jobId) setJobError(detail);
+        return detail;
+      }
+      const data = await res.json().catch(() => ({}));
+      flushClipState();
+      setJobGone(false);
+      setJobError('');
+      setResults(null);
+      setDownloadProgress(null);
+      setQueueInfo(null);
+      setJobId(targetJobId);
+      setProcessingMedia((prev) =>
+        prev && targetJobId === jobId ? prev : { type: 'server', payload: `/api/source/${targetJobId}` }
+      );
+      setLogs([
+        data.has_transcript_checkpoint
+          ? '🔁 Retrying job (reusing saved transcript checkpoint)...'
+          : '🔁 Retrying job...',
+      ]);
+      setLogTimes([Date.now() / 1000]);
+      setStatus('processing');
+      setActiveTab('dashboard');
+      return null;
+    } catch (e) {
+      const detail = e?.message || 'Could not retry this job.';
+      if (targetJobId === jobId) setJobError(detail);
+      return detail;
+    } finally {
+      setRetryingJob(false);
+    }
+  };
+
   const openLocalJob = async (targetJobId) => {
     flushClipState();
     setJobGone(false);
@@ -1792,6 +1841,17 @@ function App() {
                   >
                     {cancellingJob ? <Loader2 size={14} className="animate-spin" /> : <X size={14} />}
                     <span className="hidden sm:inline">Cancel Job</span>
+                  </button>
+                )}
+                {status === 'error' && jobId && !billingEnabled && (
+                  <button
+                    onClick={() => handleRetryJob(jobId)}
+                    disabled={retryingJob}
+                    className="btn-primary px-3 py-1.5 text-xs shrink-0"
+                    aria-label="Retry Job"
+                  >
+                    {retryingJob ? <Loader2 size={14} className="animate-spin" /> : <RotateCcw size={14} />}
+                    <span className="hidden sm:inline">Retry Job</span>
                   </button>
                 )}
               </div>
@@ -2321,6 +2381,7 @@ function App() {
             <JobsTab
               currentJobId={jobId}
               onOpenJob={openLocalJob}
+              onRetryJob={handleRetryJob}
               onNewProject={() => { handleReset(); setActiveTab('dashboard'); }}
             />
           )}
@@ -2792,8 +2853,24 @@ function App() {
                         </p>
                       </div>
                     ) : status === 'error' ? (
-                      <div className="h-full min-h-[120px] flex flex-col items-center justify-center text-danger space-y-2">
-                        <p>Generation failed.</p>
+                      <div className="h-full min-h-[160px] flex flex-col items-center justify-center text-center px-4 space-y-3">
+                        <p className="text-danger font-medium">Generation failed.</p>
+                        {jobError && (
+                          <p className="text-xs text-muted max-w-[34ch] leading-relaxed">
+                            {jobError}
+                          </p>
+                        )}
+                        {jobId && !billingEnabled && (
+                          <button
+                            type="button"
+                            onClick={() => handleRetryJob(jobId)}
+                            disabled={retryingJob}
+                            className="btn-primary px-4 py-2 text-xs"
+                          >
+                            {retryingJob ? <Loader2 size={14} className="animate-spin" /> : <RotateCcw size={14} />}
+                            {retryingJob ? 'Retrying...' : 'Retry Job'}
+                          </button>
+                        )}
                       </div>
                     ) : null
                   )}

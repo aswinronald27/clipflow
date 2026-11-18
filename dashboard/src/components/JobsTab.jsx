@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useMemo, useCallback } from 'react';
 import {
   Activity, Loader2, FolderOpen, XCircle, CheckCircle2,
-  AlertTriangle, Clock, Plus, RefreshCw, Ban,
+  AlertTriangle, Clock, Plus, RefreshCw, Ban, RotateCcw,
 } from 'lucide-react';
 import { apiFetch, apiJson } from '../lib/api';
 
@@ -24,10 +24,11 @@ function fmtTime(epoch) {
   }
 }
 
-export default function JobsTab({ currentJobId, onOpenJob, onNewProject }) {
+export default function JobsTab({ currentJobId, onOpenJob, onRetryJob, onNewProject }) {
   const [data, setData] = useState(null);
   const [filter, setFilter] = useState('all'); // all | active | completed | stopped
   const [cancelling, setCancelling] = useState({});
+  const [retrying, setRetrying] = useState({});
   const [error, setError] = useState('');
 
   const loadJobs = useCallback(async () => {
@@ -72,6 +73,19 @@ export default function JobsTab({ currentJobId, onOpenJob, onNewProject }) {
       await loadJobs();
     } finally {
       setCancelling((prev) => ({ ...prev, [jobId]: false }));
+    }
+  };
+
+  const handleRetry = async (jobId) => {
+    if (!onRetryJob) return;
+    setRetrying((prev) => ({ ...prev, [jobId]: true }));
+    setError('');
+    try {
+      const errMsg = await onRetryJob(jobId);
+      if (errMsg) setError(errMsg);
+      else await loadJobs();
+    } finally {
+      setRetrying((prev) => ({ ...prev, [jobId]: false }));
     }
   };
 
@@ -215,6 +229,20 @@ export default function JobsTab({ currentJobId, onOpenJob, onNewProject }) {
                     </div>
 
                     <div className="flex items-center gap-2 shrink-0">
+                      {!isActive && (job.status === 'failed' || job.status === 'cancelled') && job.can_retry !== false && onRetryJob && (
+                        <button
+                          type="button"
+                          onClick={() => handleRetry(job.job_id)}
+                          disabled={!!retrying[job.job_id]}
+                          className="btn-primary px-3 py-1.5 text-xs"
+                          title="Retry this job (reuses saved video & transcript when available)"
+                        >
+                          {retrying[job.job_id]
+                            ? <Loader2 size={13} className="animate-spin" />
+                            : <RotateCcw size={13} />}
+                          retry
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => onOpenJob(job.job_id)}

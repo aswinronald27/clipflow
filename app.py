@@ -6393,6 +6393,11 @@ async def process_endpoint(
                            via_api_key=jobs[job_id]['via_api_key'],
                            lane=jobs[job_id]['lane'], submitted_at=jobs[job_id]['submitted_at'],
                            topup=jobs[job_id]['topup'])
+    # Persistent retry spec (kept even after failure/cancellation so the user can
+    # retry the job in one click, reusing any downloaded source or transcript).
+    _write_retry_spec(job_id, cmd, env, source=jobs[job_id]['source'],
+                      priority=priority, user_id=user_id, partial=partial,
+                      webhook_url=webhook_url, base_url=api_base)
 
     _enqueue_job(job_id, priority)
     if _saturation_on():
@@ -6432,6 +6437,15 @@ def _job_view_from_disk(job_id):
         if glob.glob(os.path.join(job_path, "*_metadata.json")):
             _recover_jobs_from_disk()
             return jobs.get(job_id)
+        if not BILLING_ENABLED:
+            cancelled_marker = os.path.join(job_path, ".cancelled")
+            if os.path.exists(cancelled_marker):
+                return {'status': 'cancelled', 'logs': _TimedLog(["⛔ Cancelled by user."]),
+                        'user_id': None, 'result': None}
+            if _can_retry_job(job_id):
+                return {'status': 'failed',
+                        'logs': _TimedLog(["⚠️ Stopped before clips finished. Click Retry to run again."]),
+                        'user_id': None, 'result': None}
         return None
     alive = time.time() - float(m.get("heartbeat") or 0) < HEARTBEAT_STALE_AFTER
     owner = m.get("user_id")
@@ -6500,6 +6514,8 @@ async def get_status(job_id: str, request: Request):
         "partial": job.get('partial'),
         # Live yt-dlp download progress (bytes, percent, speed, eta, phase).
         "download_progress": job.get('download_progress'),
+        # Whether this job can be re-run in place via POST /api/jobs/{job_id}/retry.
+        "can_retry": _can_retry_job(job_id, job),
     }
 
 
@@ -6716,6 +6732,99 @@ def _terminate_job_proc(job_id: str) -> bool:
     return True
 
 
+_RETRY_FILE = ".retry.json"
+_RETRY_ENV_KEYS = (
+    "AUTO_HOOK", "AUTO_HOOK_STYLE", "AUTO_CAPTIONS", "AUTO_LAYOUT",
+    "CLIP_TARGET_MIN", "CLIP_TARGET_MAX", "CLIP_MIN_SECONDS", "CLIP_MAX_SECONDS",
+    "LIVE_DURATION_SECONDS", "WATCH_LIVE_CHAT", "LIVE_MODE",
+    "SOURCE_CAP_MINUTES", "DOWNLOAD_SKIP_STATICS", "WATERMARK",
+    "MAX_SOURCE_MINUTES", "SOURCE_START_SECONDS",
+)
+
+
+def _retry_env_overrides(env: Optional[dict]) -> dict:
+    if not isinstance(env, dict):
+        return {}
+    allowed = set(_RETRY_ENV_KEYS) | set(LAYOUT_ENV.values())
+    return {k: str(env[k]) for k in allowed if k in env and env[k] is not None}
+
+
+def _write_retry_spec(job_id: str, cmd: list, env: Optional[dict] = None,
+                      source: str = "", priority: int = 2, user_id=None,
+                      partial=None, webhook_url=None, base_url=None):
+    """Persist non-secret job invocation details so failed/cancelled jobs can be retried."""
+    try:
+        job_dir = os.path.join(OUTPUT_DIR, job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        write_json_atomic(os.path.join(job_dir, _RETRY_FILE), {
+            "cmd": list(cmd or []),
+            "env_overrides": _retry_env_overrides(env),
+            "source": source or "",
+            "priority": int(priority),
+            "user_id": None if user_id is None else str(user_id),
+            "partial": partial,
+            "webhook_url": webhook_url,
+            "base_url": base_url,
+        })
+    except Exception as e:
+        print(f"⚠️ Could not write retry spec for {job_id}: {e}")
+
+
+def _read_retry_spec(job_id: str) -> Optional[dict]:
+    path = os.path.join(OUTPUT_DIR, job_id, _RETRY_FILE)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _locate_retry_source(job_id: str) -> Optional[str]:
+    """Locate a retryable source video: uploads/{job_id}_*, metadata source_video,
+    or a downloaded source video sitting in output/{job_id}/ before metadata was written."""
+    found = _locate_source(job_id)
+    if found:
+        return found
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        return None
+    candidates = []
+    try:
+        for name in os.listdir(job_dir):
+            low = name.lower()
+            if name.startswith(".") or not low.endswith((".mp4", ".mkv", ".webm", ".mov")):
+                continue
+            if low.startswith(("temp_", "recut_", "autosubs_")) or "_clip_" in low:
+                continue
+            full = os.path.join(job_dir, name)
+            if os.path.isfile(full):
+                try:
+                    candidates.append((os.path.getsize(full), full))
+                except OSError:
+                    pass
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def _can_retry_job(job_id: str, job: Optional[dict] = None) -> bool:
+    """True if this job has a saved command or source file on disk to re-run."""
+    if BILLING_ENABLED:
+        return False
+    if job is not None and job.get("cmd"):
+        return True
+    spec = _read_retry_spec(job_id)
+    if spec and spec.get("cmd"):
+        return True
+    return bool(_locate_retry_source(job_id))
+
+
 def _summarize_job(job_id: str, job: dict) -> dict:
     """Compact summary row for GET /api/jobs."""
     res = job.get('result') or {}
@@ -6743,9 +6852,10 @@ def _summarize_job(job_id: str, job: dict) -> dict:
             created_at = os.path.getmtime(output_dir) if os.path.exists(output_dir) else time.time()
         except OSError:
             created_at = time.time()
+    status_val = _presented_status(job_id, job)
     return {
         "job_id": job_id,
-        "status": _presented_status(job_id, job),
+        "status": status_val,
         "title": title,
         "source": source,
         "created_at": created_at,
@@ -6753,6 +6863,7 @@ def _summarize_job(job_id: str, job: dict) -> dict:
         "download_progress": job.get('download_progress'),
         "cost_analysis": res.get('cost_analysis'),
         "last_log": logs[-1] if logs else "",
+        "can_retry": status_val in ("failed", "cancelled") and _can_retry_job(job_id, job),
     }
 
 
@@ -6774,9 +6885,10 @@ def _scan_disk_job_summary(job_id: str) -> Optional[dict]:
             base = os.path.basename(metas[0]).replace("_metadata.json", "")
             clips = data.get("shorts") or []
             rendered, _missing = _clips_actually_rendered(job_id, output_dir, base, clips)
+            status_val = "completed" if rendered else "failed"
             return {
                 "job_id": job_id,
-                "status": "completed" if rendered else "failed",
+                "status": status_val,
                 "title": base.replace("_", " "),
                 "source": data.get("source_video") or "",
                 "created_at": mtime,
@@ -6784,22 +6896,38 @@ def _scan_disk_job_summary(job_id: str) -> Optional[dict]:
                 "download_progress": None,
                 "cost_analysis": data.get("cost_analysis"),
                 "last_log": f"{len(rendered)} clip(s) ready" if rendered else "No clips rendered",
+                "can_retry": status_val == "failed" and _can_retry_job(job_id),
             }
         except Exception:
             pass
     mp4s = [f for f in os.listdir(output_dir) if f.endswith(".mp4") and not f.startswith(".")]
-    title = os.path.splitext(mp4s[0])[0].replace("_", " ") if mp4s else job_id[:8]
+    located = _locate_source(job_id) if not mp4s else None
+    spec = _read_retry_spec(job_id)
+    source_name = mp4s[0] if mp4s else (os.path.basename(located) if located else (spec.get("source") if spec else ""))
+    if mp4s:
+        title = os.path.splitext(mp4s[0])[0].replace("_", " ")
+    elif located:
+        raw_base = os.path.splitext(os.path.basename(located))[0]
+        prefix = f"{job_id}_"
+        if raw_base.startswith(prefix):
+            raw_base = raw_base[len(prefix):]
+        title = raw_base.replace("_", " ") or job_id[:8]
+    elif spec and spec.get("source"):
+        title = str(spec["source"])
+    else:
+        title = job_id[:8]
     status = "cancelled" if os.path.exists(cancelled_marker) else "failed"
     return {
         "job_id": job_id,
         "status": status,
         "title": title,
-        "source": mp4s[0] if mp4s else "",
+        "source": source_name,
         "created_at": mtime,
         "clips_count": 0,
         "download_progress": None,
         "cost_analysis": None,
         "last_log": "Cancelled by user." if status == "cancelled" else "Stopped before clips finished.",
+        "can_retry": _can_retry_job(job_id),
     }
 
 
@@ -6873,6 +7001,139 @@ async def cancel_job(job_id: str, request: Request):
     killed = _terminate_job_proc(job_id)
     print(f"⛔ [cancel] job={job_id} killed_proc={killed}", flush=True)
     return {"ok": True, "job_id": job_id, "status": "cancelled", "killed": killed}
+
+
+@app.post("/api/jobs/{job_id}/retry")
+async def retry_job(job_id: str, request: Request):
+    """Re-enqueue a failed or cancelled job in place, reusing downloaded media
+    and any saved transcript checkpoint when available."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{4,128}", job_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid job_id")
+    if BILLING_ENABLED:
+        raise HTTPException(
+            status_code=400,
+            detail="Please start a new project to re-meter and run this video again.",
+        )
+
+    existing = jobs.get(job_id)
+    if existing is not None and _presented_status(job_id, existing) in ("queued", "processing"):
+        raise HTTPException(status_code=409, detail="Job is already running or queued")
+
+    output_dir = (existing.get("output_dir") if existing else None) or os.path.join(OUTPUT_DIR, job_id)
+    os.makedirs(output_dir, exist_ok=True)
+
+    spec = _read_retry_spec(job_id) or {}
+    cmd = list(existing.get("cmd") or []) if existing else []
+    if not cmd:
+        cmd = list(spec.get("cmd") or [])
+
+    # If the saved command points to an -i file that no longer exists, or if we
+    # have no saved command (e.g. a job that failed before .retry.json existed),
+    # rebuild the command from the located source file on disk.
+    located = _locate_retry_source(job_id)
+    if cmd and "-i" in cmd:
+        idx = cmd.index("-i")
+        if idx + 1 >= len(cmd) or not os.path.isfile(cmd[idx + 1]):
+            if located:
+                cmd[idx + 1] = located
+            else:
+                cmd = []
+    if not cmd:
+        if not located:
+            raise HTTPException(
+                status_code=404,
+                detail="Original source video or URL is no longer available to retry.",
+            )
+        cmd = [sys.executable, "-u", "main.py", "-i", located, "-o", output_dir]
+    else:
+        # Ensure current Python interpreter is used in case the container was rebuilt.
+        if cmd[0] != sys.executable:
+            cmd[0] = sys.executable
+
+    api_key = await resolve_gemini(request)
+    if not api_key and not llm_backend.active():
+        raise HTTPException(
+            status_code=400,
+            detail="Gemini API key is required to retry this job. Set it in Settings first.",
+        )
+
+    env = child_env()
+    # Apply saved non-secret job options (in-memory overrides take precedence over disk spec).
+    env.update(spec.get("env_overrides") or {})
+    if existing and isinstance(existing.get("env"), dict):
+        env.update(_retry_env_overrides(existing["env"]))
+    if api_key:
+        env["GEMINI_API_KEY"] = api_key
+    else:
+        env.pop("GEMINI_API_KEY", None)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    _apply_rate_cap(env)
+
+    # Clear cancellation markers so the worker runs this job cleanly.
+    _cancelled_jobs.discard(job_id)
+    for marker in (".cancelled", _EXPIRED_MARKER):
+        try:
+            os.remove(os.path.join(output_dir, marker))
+        except OSError:
+            pass
+
+    has_checkpoint = os.path.isfile(os.path.join(output_dir, ".transcript_checkpoint.json"))
+    retry_msg = (
+        f"🔁 Retrying job {job_id} (reusing saved transcript checkpoint)..."
+        if has_checkpoint
+        else f"🔁 Retrying job {job_id}..."
+    )
+    source_label = (
+        (existing.get("source") if existing else None)
+        or spec.get("source")
+        or (os.path.basename(located) if located else "")
+    )
+    priority = int(spec.get("priority", 2))
+    api_base = (
+        (existing.get("base_url") if existing else None)
+        or spec.get("base_url")
+        or os.environ.get("PUBLIC_API_URL", "").rstrip("/")
+        or str(request.base_url).rstrip("/")
+    )
+
+    jobs[job_id] = {
+        "status": "queued",
+        "logs": _TimedLog([retry_msg]),
+        "cmd": cmd,
+        "env": env,
+        "output_dir": output_dir,
+        "source": source_label,
+        "created_at": time.time(),
+        "user_id": None,
+        "reservation_id": None,
+        "watermark": env.get("WATERMARK") == "1",
+        "partial": (existing.get("partial") if existing else None) or spec.get("partial"),
+        "webhook_url": (existing.get("webhook_url") if existing else None) or spec.get("webhook_url"),
+        "webhook_secret": existing.get("webhook_secret") if existing else None,
+        "base_url": api_base,
+        "via_api_key": False,
+        "lane": _queue_mode.NORMAL,
+        "submitted_at": _arrival_now(),
+        "topup": False,
+    }
+    _write_retry_spec(job_id, cmd, env, source=source_label, priority=priority,
+                      partial=jobs[job_id]["partial"],
+                      webhook_url=jobs[job_id]["webhook_url"], base_url=api_base)
+    _write_resume_manifest(job_id, cmd, priority, None, None,
+                           watermark=jobs[job_id]["watermark"],
+                           webhook_url=jobs[job_id]["webhook_url"],
+                           webhook_secret=jobs[job_id]["webhook_secret"],
+                           base_url=api_base, partial=jobs[job_id]["partial"],
+                           lane=jobs[job_id]["lane"],
+                           submitted_at=jobs[job_id]["submitted_at"])
+    _enqueue_job(job_id, priority)
+    print(f"🔁 [retry] job={job_id} checkpoint={has_checkpoint}", flush=True)
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": "queued",
+        "has_transcript_checkpoint": has_checkpoint,
+    }
 
 
 @app.get("/api/jobs/{job_id}/download-all")

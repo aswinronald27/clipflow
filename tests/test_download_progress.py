@@ -1,8 +1,10 @@
 import json
+import pytest
 
 
 def test_build_download_progress_with_total_bytes():
-    from main import _build_download_progress
+    main = pytest.importorskip("main")  # needs cv2/scenedetect, absent in minimal CI
+    _build_download_progress = main._build_download_progress
 
     out = _build_download_progress({
         "status": "downloading",
@@ -24,7 +26,8 @@ def test_build_download_progress_with_total_bytes():
 
 
 def test_build_download_progress_audio_and_estimate():
-    from main import _build_download_progress
+    main = pytest.importorskip("main")
+    _build_download_progress = main._build_download_progress
 
     out = _build_download_progress({
         "status": "downloading",
@@ -40,7 +43,8 @@ def test_build_download_progress_audio_and_estimate():
 
 
 def test_build_download_progress_fragments_when_total_unknown():
-    from main import _build_download_progress
+    main = pytest.importorskip("main")
+    _build_download_progress = main._build_download_progress
 
     out = _build_download_progress({
         "status": "downloading",
@@ -54,7 +58,8 @@ def test_build_download_progress_fragments_when_total_unknown():
 
 
 def test_build_download_progress_finished_becomes_merging():
-    from main import _build_download_progress
+    main = pytest.importorskip("main")
+    _build_download_progress = main._build_download_progress
 
     out = _build_download_progress({
         "status": "finished",
@@ -142,4 +147,46 @@ def test_estimate_download_size_progressive_fallback():
     assert est_bytes == 42_000_000
     assert is_est is True
     assert picked_h == 720
+
+
+def test_retry_failed_job_reuses_source_and_checkpoint(tmp_path, monkeypatch):
+    import app
+    from fastapi.testclient import TestClient
+
+    job_id = "retry_test_job_1234"
+    out_dir = tmp_path / "output"
+    job_dir = out_dir / job_id
+    job_dir.mkdir(parents=True)
+    src_video = job_dir / "sample.mp4"
+    src_video.write_bytes(b"\x00" * 16)
+    (job_dir / ".transcript_checkpoint.json").write_text('{"source":{},"transcript":{"segments":[{}]}}')
+    (job_dir / ".cancelled").write_text("1")
+
+    enqueued = []
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(out_dir))
+    monkeypatch.setattr(app, "BILLING_ENABLED", False)
+    monkeypatch.setattr(app, "_enqueue_job", lambda jid, prio=2: enqueued.append((jid, prio)))
+    app.jobs.pop(job_id, None)
+    app._cancelled_jobs.add(job_id)
+
+    try:
+        client = TestClient(app.app)
+        res = client.post(f"/api/jobs/{job_id}/retry", headers={"X-Gemini-Key": "test-key-123"})
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["ok"] is True
+        assert body["status"] == "queued"
+        assert body["has_transcript_checkpoint"] is True
+        assert enqueued == [(job_id, 2)]
+        assert job_id not in app._cancelled_jobs
+        assert not (job_dir / ".cancelled").exists()
+        assert app.jobs[job_id]["env"]["GEMINI_API_KEY"] == "test-key-123"
+        assert "-i" in app.jobs[job_id]["cmd"]
+
+        # Retrying an already queued job must return 409 Conflict.
+        res2 = client.post(f"/api/jobs/{job_id}/retry", headers={"X-Gemini-Key": "test-key-123"})
+        assert res2.status_code == 409
+    finally:
+        app.jobs.pop(job_id, None)
+        app._cancelled_jobs.discard(job_id)
 
