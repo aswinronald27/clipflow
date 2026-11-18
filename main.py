@@ -864,6 +864,52 @@ def _content_block(error_text):
     return None
 
 
+def _build_download_progress(d):
+    """Build a compact JSON-serializable dict from a yt-dlp progress_hooks dict."""
+    status = d.get('status') or 'downloading'
+    downloaded = int(d.get('downloaded_bytes') or 0)
+    total = int(d.get('total_bytes') or d.get('total_bytes_estimate') or 0)
+    frag_idx = d.get('fragment_index')
+    frag_cnt = d.get('fragment_count')
+    info_dict = d.get('info_dict') or {}
+    stream = (
+        'audio'
+        if info_dict.get('vcodec') == 'none' and info_dict.get('acodec') not in (None, 'none')
+        else 'video'
+    )
+    if status == 'finished':
+        size = total or downloaded
+        return {
+            'status': 'merging',
+            'percent': 100.0,
+            'downloaded_bytes': size,
+            'total_bytes': size,
+            'speed': None,
+            'eta': 0,
+            'stream': stream,
+        }
+    percent = None
+    if total > 0:
+        percent = min(100.0, round(downloaded * 100.0 / total, 1))
+    elif frag_cnt:
+        percent = min(100.0, round((frag_idx or 0) * 100.0 / frag_cnt, 1))
+    speed = d.get('speed')
+    eta = d.get('eta')
+    payload = {
+        'status': 'downloading',
+        'percent': percent,
+        'downloaded_bytes': downloaded,
+        'total_bytes': total,
+        'speed': int(speed) if isinstance(speed, (int, float)) and speed > 0 else None,
+        'eta': int(eta) if isinstance(eta, (int, float)) and eta >= 0 else None,
+        'stream': stream,
+    }
+    if frag_cnt:
+        payload['fragment_index'] = int(frag_idx or 0)
+        payload['fragment_count'] = int(frag_cnt)
+    return payload
+
+
 def download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
                            cap_minutes=None, route_out=None):
     """Download ``url`` with only public addresses resolvable (ssrf_guard): the
@@ -998,19 +1044,491 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
     # Wire bytes actually pulled through the (paid) proxy, summed across
     # fragments/streams. Reported to app.py via the PROXY_BYTES= line below.
     _dl_bytes = {"total": 0, "partial": 0}
+    _dl_ui = {"last_ts": 0.0, "last_pct": -1, "last_stream": None}
+
+    def _emit_dl_progress(payload):
+        print("DOWNLOAD_PROGRESS=" + json.dumps(payload, separators=(",", ":")), flush=True)
 
     def _progress_hook(d):
         if d.get('status') == 'downloading':
             # Bytes of a fragment still in flight: a failed attempt has
             # already paid for these even though 'finished' never fires.
             _dl_bytes["partial"] = int(d.get('downloaded_bytes') or 0)
+            now = time.monotonic()
+            payload = _build_download_progress(d)
+            pct = payload.get("percent")
+            stream = payload.get("stream")
+            pct_step = pct is not None and int(pct) >= _dl_ui["last_pct"] + 2 and (now - _dl_ui["last_ts"]) >= 0.25
+            if (now - _dl_ui["last_ts"]) >= 0.5 or stream != _dl_ui["last_stream"] or pct_step:
+                _dl_ui["last_ts"] = now
+                _dl_ui["last_pct"] = int(pct) if pct is not None else -1
+                _dl_ui["last_stream"] = stream
+                _emit_dl_progress(payload)
         elif d.get('status') == 'finished':
             _dl_bytes["partial"] = 0
             _dl_bytes["total"] += int(d.get('total_bytes')
                                       or d.get('total_bytes_estimate')
                                       or d.get('downloaded_bytes') or 0)
+            _dl_ui["last_ts"] = time.monotonic()
+            _dl_ui["last_pct"] = 100
+            _emit_dl_progress(_build_download_progress(d))
 
     _early = {"started": False}
+    _live_meta = {}
+
+    def _download_live_dvr(sanitized, extractor_args, proxy, cookies):
+        """Fast live-stream rewind: fetch the last N minutes ALREADY streamed
+        from YouTube's live DASH DVR buffer at full download speed (much faster
+        than waiting 1x realtime). Audio downloads first so transcription runs
+        in parallel while the 1080p video segments arrive."""
+        import httpx
+        import youtube_live_chat
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        try:
+            raw_dur = os.environ.get("LIVE_DURATION_SECONDS", "").strip()
+            live_seconds = int(round(float(raw_dur))) if raw_dur else 300
+        except ValueError:
+            live_seconds = 300
+        live_seconds = max(60, min(3600, live_seconds))
+        watch_chat = os.environ.get("WATCH_LIVE_CHAT", "1").strip() != "0"
+
+        dvr_opts = {
+            **_base_opts(extractor_args, proxy, cookies),
+            'quiet': True, 'verbose': False,
+            'live_from_start': True,
+        }
+        with yt_dlp.YoutubeDL(dvr_opts) as ydl:
+            dvr_info = ydl.extract_info(url, download=False)
+
+        fmts = dvr_info.get('formats') or []
+        v_cands = [
+            f for f in fmts
+            if f.get('vcodec', 'none') != 'none'
+            and f.get('acodec', 'none') == 'none'
+            and f.get('url')
+            and (f.get('height') or 0) <= 1080
+            and str(f.get('protocol') or '').startswith('http_dash')
+        ]
+        a_cands = [
+            f for f in fmts
+            if f.get('vcodec', 'none') == 'none'
+            and f.get('acodec', 'none') != 'none'
+            and f.get('url')
+            and str(f.get('protocol') or '').startswith('http_dash')
+        ]
+        if not v_cands or not a_cands:
+            return None
+
+        # Prefer avc1 mp4 <= 1080p (e.g. itag 137/136) + m4a (itag 140).
+        def _v_pick(pool):
+            for sub in (
+                [f for f in pool if str(f.get('vcodec') or '').startswith('avc1') and f.get('ext') == 'mp4'],
+                [f for f in pool if f.get('ext') == 'mp4'],
+                pool,
+            ):
+                if sub:
+                    return max(sub, key=lambda f: (int(f.get('height') or 0), float(f.get('tbr') or 0)))
+            return None
+
+        def _a_pick(pool):
+            for sub in ([f for f in pool if f.get('ext') == 'm4a'], pool):
+                if sub:
+                    return max(sub, key=lambda f: float(f.get('abr') or f.get('tbr') or 0))
+            return None
+
+        vf = _v_pick(v_cands)
+        af = _a_pick(a_cands)
+        if not vf or not af:
+            return None
+
+        client_kwargs = {"timeout": 20.0, "follow_redirects": True}
+        if proxy:
+            client_kwargs["proxy"] = proxy
+
+        expected = os.path.join(output_dir, f'{sanitized}.mp4')
+        tmp_v = os.path.join(output_dir, f'.dvr_video_{sanitized}.{vf.get("ext") or "mp4"}')
+        tmp_a = os.path.join(output_dir, f'.dvr_audio_{sanitized}.{af.get("ext") or "m4a"}')
+        for p in (expected, tmp_v, tmp_a):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+        with httpx.Client(**client_kwargs) as client:
+            head_r = client.head(vf['url'])
+            if 'x-head-seqnum' not in head_r.headers:
+                return None
+            head_seq = int(head_r.headers['x-head-seqnum'])
+            if head_seq < 5:
+                return None
+            head_sec = float(head_r.headers.get('x-head-time-sec') or (head_seq * 5))
+            seg_dur = max(1.0, head_sec / max(1, head_seq))
+            n_segs = max(1, min(head_seq, int(round(live_seconds / seg_dur))))
+            start_seq = max(0, head_seq - n_segs)
+            seqs = list(range(start_seq, head_seq))
+            actual_window_s = round(len(seqs) * seg_dur, 1)
+            capture_end_epoch = time.time()
+
+            print(f"⚡ Live DVR rewind: downloading last {actual_window_s / 60:.1f} min "
+                  f"({len(seqs)} segments, {vf.get('height')}p) at full speed...", flush=True)
+
+            def _fetch_seg(base_url, sq):
+                for _try in range(3):
+                    try:
+                        r = client.get(f"{base_url}&sq={sq}")
+                        if r.status_code == 200 and r.content:
+                            return sq, r.content
+                    except Exception:
+                        pass
+                    time.sleep(0.3)
+                return sq, b""
+
+            # Step 1: Pull audio segments FIRST (tiny: ~1 MB/min) so early
+            # transcription can run while the larger 1080p video downloads.
+            _emit_dl_progress({
+                "status": "downloading",
+                "percent": 0.0,
+                "downloaded_bytes": 0,
+                "total_bytes": 0,
+                "speed": None,
+                "eta": None,
+                "stream": "audio",
+                "fragment_index": 0,
+                "fragment_count": len(seqs),
+            })
+            a_parts = {}
+            a_bytes = 0
+            t_a0 = time.monotonic()
+            with ThreadPoolExecutor(max_workers=12) as ex:
+                futs = [ex.submit(_fetch_seg, af['url'], s) for s in seqs]
+                done_a = 0
+                last_a_emit = 0.0
+                for fut in as_completed(futs):
+                    sq, data = fut.result()
+                    a_parts[sq] = data
+                    a_bytes += len(data)
+                    done_a += 1
+                    now = time.monotonic()
+                    if now - last_a_emit >= 0.5 or done_a == len(seqs):
+                        last_a_emit = now
+                        est_a = int(a_bytes * len(seqs) / max(1, done_a))
+                        spd = int(a_bytes / max(0.2, now - t_a0))
+                        _emit_dl_progress({
+                            "status": "downloading",
+                            "percent": round(done_a * 100.0 / len(seqs), 1),
+                            "downloaded_bytes": a_bytes,
+                            "total_bytes": est_a,
+                            "speed": spd,
+                            "eta": int(max(0, (est_a - a_bytes) / max(1, spd))),
+                            "stream": "audio",
+                            "fragment_index": done_a,
+                            "fragment_count": len(seqs),
+                        })
+
+            with open(tmp_a, "wb") as fa:
+                for s in seqs:
+                    fa.write(a_parts.get(s, b""))
+
+            # Start optional recent live chat fetch in parallel.
+            chat_holder = {"msgs": [], "hype": []}
+            chat_thread = None
+            if watch_chat and is_youtube_url(url):
+                def _grab_chat():
+                    msgs, hype = youtube_live_chat.fetch_recent_chat_for_rewind(
+                        url, capture_end_epoch - actual_window_s, actual_window_s
+                    )
+                    chat_holder["msgs"] = msgs
+                    chat_holder["hype"] = hype
+                chat_thread = threading.Thread(target=_grab_chat, daemon=True)
+                chat_thread.start()
+
+            # Kick off early audio transcription right away while video downloads!
+            if on_audio and not _early["started"] and os.path.getsize(tmp_a) > 10_000:
+                _early["started"] = True
+                early_copy = os.path.join(output_dir, f'.early_audio.{af.get("ext") or "m4a"}')
+                try:
+                    import shutil
+                    shutil.copyfile(tmp_a, early_copy)
+                    print(f"🎧 Audio ready ahead of the video ({a_bytes / 1_048_576:.1f} MB) — transcribing while video downloads!", flush=True)
+                    on_audio(early_copy, actual_window_s)
+                except Exception:
+                    pass
+
+            # Step 2: Pull 1080p video segments concurrently with live progress.
+            v_parts = {}
+            v_bytes = 0
+            t_v0 = time.monotonic()
+            last_v_emit = 0.0
+            with ThreadPoolExecutor(max_workers=12) as ex:
+                futs = [ex.submit(_fetch_seg, vf['url'], s) for s in seqs]
+                done_v = 0
+                for fut in as_completed(futs):
+                    sq, data = fut.result()
+                    v_parts[sq] = data
+                    v_bytes += len(data)
+                    done_v += 1
+                    now = time.monotonic()
+                    if now - last_v_emit >= 0.5 or done_v == len(seqs):
+                        last_v_emit = now
+                        est_v = int(v_bytes * len(seqs) / max(1, done_v))
+                        spd = int(v_bytes / max(0.2, now - t_v0))
+                        _emit_dl_progress({
+                            "status": "downloading",
+                            "percent": min(99.5, round(done_v * 100.0 / len(seqs), 1)),
+                            "downloaded_bytes": v_bytes,
+                            "total_bytes": est_v,
+                            "speed": spd,
+                            "eta": int(max(0, (est_v - v_bytes) / max(1, spd))),
+                            "stream": "video",
+                            "fragment_index": done_v,
+                            "fragment_count": len(seqs),
+                        })
+
+            with open(tmp_v, "wb") as fv:
+                for s in seqs:
+                    fv.write(v_parts.get(s, b""))
+
+        if chat_thread is not None:
+            chat_thread.join(timeout=5)
+
+        # Step 3: Stream-copy remux video + audio into a clean faststart MP4.
+        _emit_dl_progress({
+            "status": "merging",
+            "percent": 100.0,
+            "downloaded_bytes": v_bytes + a_bytes,
+            "total_bytes": v_bytes + a_bytes,
+            "speed": None,
+            "eta": 0,
+            "stream": "video",
+        })
+        mux = subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-i", tmp_v, "-i", tmp_a, "-c", "copy", "-movflags", "+faststart", expected],
+            capture_output=True, timeout=120,
+        )
+        for p in (tmp_v, tmp_a):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        if mux.returncode != 0 or not os.path.exists(expected) or os.path.getsize(expected) < 10_000:
+            raise RuntimeError(f"Live DVR mux failed (rc={mux.returncode}): {mux.stderr.decode('utf-8', 'replace')[:200]}")
+
+        _dl_bytes["total"] = os.path.getsize(expected)
+        msgs = chat_holder["msgs"]
+        hype = chat_holder["hype"]
+        if hype or msgs:
+            try:
+                write_json_atomic(os.path.join(output_dir, "live_chat_hype.json"), {
+                    "messages_count": len(msgs),
+                    "duration": actual_window_s,
+                    "hype_moments": hype,
+                }, indent=2)
+            except Exception:
+                pass
+            print(f"💬 Live chat watched: {len(msgs)} message(s), found {len(hype)} hype moment(s).", flush=True)
+        _live_meta.update({
+            "chat_messages": len(msgs),
+            "chat_spikes": len(hype),
+            "watch_chat": watch_chat,
+        })
+        return sanitized
+
+    def _capture_live_stream(info, sanitized, extractor_args, proxy, cookies):
+        """Capture a bounded duration of an active livestream via ffmpeg while
+        watching YouTube live chat in parallel for hype moments."""
+        import youtube_live_chat
+        try:
+            raw_dur = os.environ.get("LIVE_DURATION_SECONDS", "").strip()
+            live_seconds = int(round(float(raw_dur))) if raw_dur else 300
+        except ValueError:
+            live_seconds = 300
+        live_seconds = max(60, min(3600, live_seconds))
+        watch_chat = os.environ.get("WATCH_LIVE_CHAT", "1").strip() != "0"
+
+        # Resolve the best combined <=1080p HLS stream URL (or separate v+a URLs).
+        resolve_opts = {
+            **_base_opts(extractor_args, proxy, cookies),
+            'quiet': True, 'verbose': False,
+            'format': 'best[height<=1080]/best',
+        }
+        with yt_dlp.YoutubeDL(resolve_opts) as ydl:
+            resolved = ydl.process_ie_result(info, download=False)
+
+        stream_urls = []
+        if resolved.get('url'):
+            stream_urls = [resolved['url']]
+        elif resolved.get('requested_formats'):
+            stream_urls = [rf['url'] for rf in resolved['requested_formats'] if rf.get('url')]
+        if not stream_urls:
+            raise RuntimeError("Could not resolve a live stream URL for ffmpeg capture.")
+
+        expected = os.path.join(output_dir, f'{sanitized}.mp4')
+        if os.path.exists(expected):
+            os.remove(expected)
+
+        print(f"🔴 Live stream detected — capturing {live_seconds // 60}m {live_seconds % 60:02d}s"
+              f"{' while watching live chat' if watch_chat else ''}...", flush=True)
+
+        watcher = None
+        if watch_chat and is_youtube_url(url):
+            watcher = youtube_live_chat.LiveChatWatcher(url)
+            watcher.start()
+
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+        for su in stream_urls:
+            cmd.extend([
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5",
+                "-rw_timeout", "15000000",
+                "-i", su,
+            ])
+        cmd.extend([
+            "-t", str(live_seconds),
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
+            "-movflags", "+faststart",
+            "-progress", "pipe:1",
+            "-nostats",
+            expected,
+        ])
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        capture_t0 = time.monotonic()
+        hard_deadline = capture_t0 + live_seconds + 150
+        last_emit = 0.0
+        prev_bytes = 0
+        prev_ts = capture_t0
+        last_speed = None
+        out_time_s = 0.0
+        cur_bytes = 0
+
+        _emit_dl_progress({
+            "status": "capturing_live",
+            "percent": 0.0,
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
+            "speed": None,
+            "eta": live_seconds,
+            "elapsed": 0.0,
+            "target_seconds": live_seconds,
+            "chat_messages": 0,
+            "chat_spikes": 0,
+            "watch_chat": watch_chat,
+            "stream": "video",
+        })
+
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                now = time.monotonic()
+                if now > hard_deadline:
+                    try:
+                        import signal
+                        proc.send_signal(signal.SIGINT)
+                        proc.wait(timeout=5)
+                    except Exception:
+                        proc.kill()
+                    break
+                line = line.strip()
+                if line.startswith("out_time_us="):
+                    try:
+                        val = int(line.split("=", 1)[1])
+                        if val >= 0:
+                            out_time_s = val / 1_000_000.0
+                    except ValueError:
+                        pass
+                elif line.startswith("total_size="):
+                    try:
+                        val = int(line.split("=", 1)[1])
+                        if val >= 0:
+                            cur_bytes = val
+                    except ValueError:
+                        pass
+                elif line == "progress=continue" or line == "progress=end":
+                    if now - last_emit >= 1.0 or line == "progress=end":
+                        dt = max(0.1, now - prev_ts)
+                        if cur_bytes == 0 and os.path.exists(expected):
+                            try:
+                                cur_bytes = os.path.getsize(expected)
+                            except OSError:
+                                pass
+                        if cur_bytes > prev_bytes:
+                            last_speed = int((cur_bytes - prev_bytes) / dt)
+                            prev_bytes = cur_bytes
+                            prev_ts = now
+                        elif cur_bytes > 0 and last_speed is None:
+                            last_speed = int(cur_bytes / max(1.0, now - capture_t0))
+                        last_emit = now
+                        pct = min(99.5, round(out_time_s * 100.0 / live_seconds, 1)) if live_seconds > 0 else 0.0
+                        eta = max(0, int(round(live_seconds - out_time_s)))
+                        _emit_dl_progress({
+                            "status": "capturing_live",
+                            "percent": pct,
+                            "downloaded_bytes": cur_bytes,
+                            "total_bytes": 0,
+                            "speed": last_speed,
+                            "eta": eta,
+                            "elapsed": round(out_time_s, 1),
+                            "target_seconds": live_seconds,
+                            "chat_messages": watcher.total_messages if watcher else 0,
+                            "chat_spikes": watcher.live_spike_count() if watcher else 0,
+                            "watch_chat": watch_chat,
+                            "stream": "video",
+                        })
+            proc.wait(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            messages = watcher.stop() if watcher else []
+
+        if proc.returncode != 0 or not os.path.exists(expected) or os.path.getsize(expected) < 10_000:
+            err = (proc.stderr.read() if proc.stderr else "")[:300]
+            raise RuntimeError(f"Live stream capture failed (ffmpeg rc={proc.returncode}): {err}")
+
+        actual_size = os.path.getsize(expected)
+        _dl_bytes["total"] = actual_size
+        actual_dur = out_time_s if out_time_s > 0 else float(live_seconds)
+        try:
+            _p = subprocess.check_output(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", expected],
+                stderr=subprocess.DEVNULL, timeout=15,
+            ).decode().strip()
+            if _p:
+                actual_dur = float(_p)
+        except Exception:
+            pass
+        hype_moments = youtube_live_chat.detect_hype_moments(messages, actual_dur) if messages else []
+        if hype_moments or messages:
+            hype_path = os.path.join(output_dir, "live_chat_hype.json")
+            try:
+                write_json_atomic(hype_path, {
+                    "messages_count": len(messages),
+                    "duration": actual_dur,
+                    "hype_moments": hype_moments,
+                }, indent=2)
+            except Exception:
+                pass
+            print(f"💬 Live chat watched: {len(messages)} message(s), found {len(hype_moments)} hype moment(s).", flush=True)
+        elif watch_chat:
+            print("💬 Live chat: no chat messages received during capture — clipping from transcript.", flush=True)
+
+        _live_meta.update({
+            "target_seconds": live_seconds,
+            "chat_messages": len(messages),
+            "chat_spikes": len(hype_moments),
+            "watch_chat": watch_chat,
+        })
+        return sanitized
 
     # A job only paid for so many minutes (MAX_SOURCE_MINUTES: the quota-wall
     # offer; SOURCE_CAP_MINUTES: every metered job, a safety cap). yt-dlp used
@@ -1063,6 +1581,18 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
     def _attempt(extractor_args, fmt, proxy, cookies=True):
         _dl_bytes["total"] = 0
         _dl_bytes["partial"] = 0
+        _dl_ui["last_ts"] = 0.0
+        _dl_ui["last_pct"] = -1
+        _dl_ui["last_stream"] = None
+        _emit_dl_progress({
+            "status": "starting",
+            "percent": 0.0,
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
+            "speed": None,
+            "eta": None,
+            "stream": "video",
+        })
         # Extracted ONCE, unprocessed, and handed to the download below: a
         # plain ydl.download([url]) ran the whole extraction again (player
         # clients, API JSON, m3u8), 4-9 s of round trips per attempt.
@@ -1079,6 +1609,17 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
             import ssrf_guard
             ssrf_guard.assert_public_urls(info)
         sanitized = sanitize_filename(info.get('title', 'youtube_video'))
+        if info.get('is_live') or info.get('live_status') == 'is_live':
+            live_mode = os.environ.get("LIVE_MODE", "rewind").strip().lower()
+            if live_mode != "live" and is_youtube_url(url):
+                try:
+                    dvr_res = _download_live_dvr(sanitized, extractor_args, proxy, cookies)
+                    if dvr_res is not None:
+                        return dvr_res
+                    print("ℹ️ DVR rewind unavailable for this stream — falling back to real-time live capture.", flush=True)
+                except Exception as _dvr_err:
+                    print(f"ℹ️ DVR rewind skipped ({_dvr_err}) — falling back to real-time live capture.", flush=True)
+            return _capture_live_stream(info, sanitized, extractor_args, proxy, cookies)
         # Only when the whole source is far bigger than what was paid for: a
         # ranged fetch goes through ffmpeg at ~1-2.5x realtime, while a native
         # download of a source a bit over the cap takes seconds. A 21-min video
@@ -1111,6 +1652,16 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
             dl_opts['download_ranges'] = download_range_func(None, [(0, _range_cap)])
             print(f"✂️ Source is {'of unknown length' if not info.get('duration') else 'longer than the paid minutes'}"
                   f": downloading only the first {_range_cap / 60:.0f} min.")
+            _emit_dl_progress({
+                "status": "downloading",
+                "percent": None,
+                "downloaded_bytes": 0,
+                "total_bytes": 0,
+                "speed": None,
+                "eta": None,
+                "stream": "video",
+                "ranged": True,
+            })
         with yt_dlp.YoutubeDL(dl_opts) as ydl:
             if info.get('_type', 'video') == 'video' and info.get('formats'):
                 ydl.process_ie_result(info, download=True)
@@ -1273,6 +1824,22 @@ Technical Details: {str(last_err)}
         # Machine-parseable marker consumed by app.py's log reader for the
         # monthly proxy-bandwidth counter. Not shown to clients (log filter).
         print(f"PROXY_BYTES={paid_bytes}")
+    elapsed = round(time.time() - step_start_time, 1)
+    try:
+        final_bytes = os.path.getsize(downloaded_file) if os.path.exists(downloaded_file) else _dl_bytes["total"]
+    except OSError:
+        final_bytes = _dl_bytes["total"]
+    _emit_dl_progress({
+        "status": "done",
+        "percent": 100.0,
+        "downloaded_bytes": final_bytes,
+        "total_bytes": final_bytes,
+        "speed": None,
+        "eta": 0,
+        "elapsed": elapsed,
+        "stream": "video",
+        **_live_meta,
+    })
     print(f"✅ Video downloaded in {time.time() - step_start_time:.2f}s: {downloaded_file}")
     return downloaded_file, sanitized_title
 
@@ -2011,12 +2578,14 @@ def _run_gemini_stage(client, model_name, prompt, schema):
         response_mime_type="application/json",
         response_schema=schema,
     )
-    max_attempts = 3
+    max_attempts = 4
+    current_model = model_name
+    fallback_model = (os.environ.get("GEMINI_FALLBACK_MODEL") or "gemini-2.5-flash").strip()
     for attempt in range(1, max_attempts + 1):
         try:
             if use_local:
-                return llm_backend.generate_json(prompt, schema, model=model_name)
-            response = client.models.generate_content(model=model_name, contents=prompt, config=config)
+                return llm_backend.generate_json(prompt, schema, model=current_model)
+            response = client.models.generate_content(model=current_model, contents=prompt, config=config)
             # Policy blocks are deterministic — retrying only burns quota and
             # time, and the user deserves the real reason instead of a generic
             # "empty response" (prod 23-jul: PROHIBITED_CONTENT on every try).
@@ -2031,14 +2600,14 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             else:
                 parsed = gemini_worker._parse_json_response_text(
                     gemini_worker._get_response_text(response))
-            return parsed, gemini_worker._calculate_cost_analysis(response, model_name)
+            return parsed, gemini_worker._calculate_cost_analysis(response, current_model)
         except gemini_worker.GeminiBlockedError:
             raise  # deterministic policy block — never retry
         except Exception as e:
             msg = str(e)
             transient = any(tok in msg for tok in (
                 '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
-                '500', 'INTERNAL', 'overloaded', 'Deadline',
+                '500', 'INTERNAL', 'overloaded', 'Deadline', 'timeout', 'Timeout', 'timed out',
                 'empty response body', 'did not contain a JSON object',
                 'Failed to parse Gemini JSON response',
                 # OpenAI-compatible servers: model still loading, busy, or a
@@ -2047,9 +2616,19 @@ def _run_gemini_stage(client, model_name, prompt, schema):
                 'validation error'))
             if attempt == max_attempts or not transient:
                 raise
+            # If the primary Gemini model is overloaded/timed out (503 / ReadTimeout),
+            # immediately switch to the fallback model on the next try instead of hanging.
+            overloaded = any(tok in msg for tok in (
+                '503', 'UNAVAILABLE', 'overloaded', 'ReadTimeout', 'Timeout', 'timeout', 'timed out', 'Deadline'))
+            if (not use_local and overloaded and fallback_model
+                    and current_model != fallback_model):
+                print(f"🔁 {current_model} unavailable/timed out — falling back to {fallback_model}...", flush=True)
+                current_model = fallback_model
+                time.sleep(2)
+                continue
             wait = 5 * (2 ** (attempt - 1))
             who = "LLM server" if use_local else "Gemini"
-            print(f"⚠️ {who} transient error (attempt {attempt}/{max_attempts}), retrying in {wait}s: {msg[:150]}")
+            print(f"⚠️ {who} transient error (attempt {attempt}/{max_attempts}), retrying in {wait}s: {msg[:150]}", flush=True)
             time.sleep(wait)
 
 
@@ -2093,7 +2672,7 @@ def score_batch_size():
     return 3 if llm_backend.active() else 8
 
 
-def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
+def get_viral_clips(transcript_result, video_duration, viewer_clips=None, chat_hype=None):
     """Two-pass clip selection: score transcript windows, then detail the best.
 
     Windowing gives even coverage on long videos (a single call over the whole
@@ -2118,7 +2697,8 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             print("❌ Error: GEMINI_API_KEY not found in environment variables "
                   "(set it, or point LLM_BASE_URL at an OpenAI-compatible server).")
             return None
-        client = genai.Client(api_key=api_key)
+        timeout_ms = int(os.environ.get("GEMINI_TIMEOUT_MS", "45000") or 45000)
+        client = genai.Client(api_key=api_key, http_options=genai_types.HttpOptions(timeout=timeout_ms))
         model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
     print(f"\U0001f916  Model: {model_name} | language: {language}")
 
@@ -2155,6 +2735,10 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         heat = twitch_signals.window_heat(windows, viewer_clips) if viewer_clips else {}
         if heat:
             print(f"   👀 Viewer clips fall in {len(heat)} window(s).")
+        import youtube_live_chat
+        chat_heat = youtube_live_chat.chat_window_heat(windows, chat_hype) if chat_hype else {}
+        if chat_heat:
+            print(f"   💬 Live chat hype spikes fall in {len(chat_heat)} window(s).")
 
         def _payload(ws):
             out = []
@@ -2165,6 +2749,13 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                     item["viewers_clipped"] = h["clips"]
                     item["viewer_clip_views"] = h["views"]
                     item["viewer_moments"] = h["spans"][:5]
+                ch = chat_heat.get(w["id"])
+                if ch:
+                    item["chat_messages"] = ch["messages"]
+                    item["chat_spike_ratio"] = ch["spike_ratio"]
+                    item["chat_hype_moments"] = ch["spans"][:5]
+                    if ch["sample_chat"]:
+                        item["chat_reactions"] = ch["sample_chat"]
                 out.append(item)
             return out
 
@@ -2192,6 +2783,13 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             added = [w["id"] for w in shortlist if w["id"] not in before]
             if added:
                 print(f"   👀 Promoted {len(added)} window(s) viewers clipped: {added}")
+        if chat_heat:
+            before = {w["id"] for w in shortlist}
+            ranked = [by_id[w["id"]] for w in scored if w.get("id") in by_id] or windows
+            shortlist = youtube_live_chat.promote_chat_hot_windows(shortlist, ranked, chat_heat, target)
+            added = [w["id"] for w in shortlist if w["id"] not in before]
+            if added:
+                print(f"   💬 Promoted {len(added)} live-chat hype window(s): {added}")
         print(f"   Shortlisted {len(shortlist)} window(s) for detail.")
 
         # --- Pass 2: detailed clip extraction on the shortlist ---
@@ -2635,7 +3233,12 @@ if __name__ == '__main__':
             try:
                 t = transcribe_video(audio_path)
                 early["transcript"] = t
-                if audio_duration and not speech_is_sparse(t, audio_duration):
+                # On live-chat jobs, wait for chat_hype so Gemini runs once with chat signals.
+                skip_early_gemini = bool(
+                    os.environ.get("LIVE_DURATION_SECONDS", "").strip()
+                    and os.environ.get("WATCH_LIVE_CHAT", "1").strip() != "0"
+                )
+                if audio_duration and not skip_early_gemini and not speech_is_sparse(t, audio_duration):
                     early["clips"] = get_viral_clips(t, audio_duration,
                                                      viewer_clips=viewer_clips)
             except Exception as e:
@@ -2820,16 +3423,31 @@ if __name__ == '__main__':
                   f"switching to visual analysis.")
             transcript = None
 
+        # Load YouTube live chat hype spikes if captured during a live stream.
+        chat_hype = []
+        _hype_file = os.path.join(output_dir, "live_chat_hype.json")
+        if os.path.exists(_hype_file):
+            try:
+                with open(_hype_file, "r", encoding="utf-8") as _hf:
+                    chat_hype = (json.load(_hf) or {}).get("hype_moments") or []
+            except Exception:
+                chat_hype = []
+
         # 4. Gemini Analysis (transcript-driven, or vision for silent videos)
         early_clips = (early_state or {}).get("clips") if early_state else None
         if (transcript is not None and early_clips
-                and transcript is early_state["transcript"]):
+                and transcript is early_state["transcript"] and not chat_hype):
             print("♻️ Using the clips Gemini picked while the video downloaded.")
             clips_data = early_clips
         elif transcript is not None:
-            clips_data = get_viral_clips(transcript, duration, viewer_clips=viewer_clips)
+            clips_data = get_viral_clips(transcript, duration,
+                                         viewer_clips=viewer_clips, chat_hype=chat_hype)
         else:
-            clips_data = get_visual_clips(input_video, duration, viewer_clips=viewer_clips)
+            visual_hints = list(viewer_clips or []) + [
+                {"start": m["start"], "end": m["end"], "views": int(m.get("messages") or 1)}
+                for m in chat_hype
+            ]
+            clips_data = get_visual_clips(input_video, duration, viewer_clips=visual_hints)
 
         if not clips_data or 'shorts' not in clips_data:
             # Deliberately fail instead of reframing the whole video: that path

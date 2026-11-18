@@ -273,6 +273,11 @@ Rules:
   live viewers clipped that stretch themselves. That is strong evidence the
   moment lands even when the transcript looks thin (a chase, a crash, a scream),
   so weigh it up; the window still has to make sense to a cold viewer.
+- A window may carry `chat_messages` / `chat_spike_ratio` / `chat_reactions`:
+  the live YouTube chat exploded during this window (multiple times normal chat
+  speed, with viewer reactions attached). Treat strong chat spikes as high-signal
+  evidence that something exciting, funny, shocking, or clip-worthy happened on
+  stream, even if the spoken transcript looks sparse.
 
 TRANSCRIPT_LANGUAGE: {language}
 VIDEO_DURATION_SECONDS: {video_duration}
@@ -307,6 +312,10 @@ CLIP RULES:
 - When a window has `viewer_moments` ([start, end] stretches the stream's
   viewers clipped), the best clip of that window should cover the strongest
   of them, opening a few seconds before it so the moment has its setup.
+- When a window has `chat_hype_moments` ([start, end] stretches where live chat
+  spiked) and `chat_reactions`, prioritize cutting clips around those chat-spike
+  moments, opening a few seconds before the spike so the viewer sees what caused
+  chat to react and the immediate payoff.
 - Do not cut in the middle of a word or phrase.
 - No generic intros/outros unless they are the hook.
 - STANDS ALONE: the clip must make sense to someone who has seen nothing else.

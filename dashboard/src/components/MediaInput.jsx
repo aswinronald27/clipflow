@@ -3,6 +3,7 @@ import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown } from 'lucide-
 import { track } from '../lib/analytics';
 import { getApiUrl } from '../config';
 import SourceCost from './SourceCost';
+import UrlSizePreview from './UrlSizePreview';
 
 const SUPPORTED_PLATFORMS = [
     'YouTube', 'Vimeo', 'TikTok', 'X / Twitter', 'Twitch', 'Kick',
@@ -41,6 +42,11 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [acknowledged, setAcknowledged] = useState(false);
     // {start, end} in seconds when the user picked a stretch under the cost line.
     const [range, setRange] = useState(null);
+    // Pre-submit preview returned by /api/url-preview (size, resolution, is_live).
+    const [urlPreview, setUrlPreview] = useState(null);
+    const [liveMode, setLiveMode] = useState('rewind'); // 'rewind' (fast DVR) | 'live' (realtime + full chat)
+    const [liveDurationMinutes, setLiveDurationMinutes] = useState(5);
+    const [watchLiveChat, setWatchLiveChat] = useState(true);
     const [outputFormat, setOutputFormat] = useState('vertical'); // vertical | horizontal | square
     const [showInfo, setShowInfo] = useState(false);
     // Advanced generation controls — empty string means "let the AI decide",
@@ -129,6 +135,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
             layout,
             sourceStart: range ? Math.round(range.start) : null,
             sourceEnd: range ? Math.round(range.end) : null,
+            liveDurationMinutes: (mode === 'url' && urlPreview?.is_live) ? liveDurationMinutes : null,
+            watchLiveChat: (mode === 'url' && urlPreview?.is_live) ? watchLiveChat : null,
+            liveMode: (mode === 'url' && urlPreview?.is_live) ? liveMode : null,
         };
         try {
             localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
@@ -228,6 +237,13 @@ export default function MediaInput({ onProcess, isProcessing }) {
                             <div className="flex items-center justify-center gap-3 text-ok min-w-0">
                                 <FileVideo size={18} className="shrink-0" />
                                 <span className="font-medium truncate">{file.name}</span>
+                                {file.size > 0 && (
+                                    <span className="readout normal-case text-muted shrink-0 tabular-nums">
+                                        {file.size >= 1024 ** 3
+                                            ? `${(file.size / 1024 ** 3).toFixed(1)} GB`
+                                            : `${(file.size / 1024 ** 2).toFixed(file.size >= 100 * 1024 ** 2 ? 0 : 1)} MB`}
+                                    </span>
+                                )}
                                 <button
                                     type="button"
                                     onClick={() => setFile(null)}
@@ -256,6 +272,84 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 <p className="readout mt-2">MP4, MOV up to 500MB · at least {MIN_SOURCE_SECONDS}s long</p>
                             </label>
                         )}
+                    </div>
+                )}
+
+                <UrlSizePreview mode={mode} url={url} onPreview={setUrlPreview} />
+
+                {/* Live stream capture + chat hype options (auto-shown for active YouTube Live links) */}
+                {mode === 'url' && urlPreview?.is_live && (
+                    <div className="mt-3 rounded-input border border-brass/35 bg-paper px-3.5 py-3 text-left space-y-3 animate-fade">
+                        <div>
+                            <p className="eyebrow mb-2">Live clipping mode</p>
+                            <div className="grid grid-cols-2 gap-2">
+                                <button
+                                    type="button"
+                                    onClick={() => setLiveMode('rewind')}
+                                    className={`px-3 py-2 rounded-input border text-left transition-colors ${liveMode === 'rewind'
+                                        ? 'border-brass bg-brass/15 text-ink'
+                                        : 'border-rule2 text-muted hover:border-brass/60 hover:text-ink2'
+                                        }`}
+                                >
+                                    <span className="block text-xs font-medium">⚡ Rewind (Fast)</span>
+                                    <span className="block text-[11px] text-muted mt-0.5 leading-snug">
+                                        Last {liveDurationMinutes} min already streamed · downloads at full speed
+                                    </span>
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setLiveMode('live')}
+                                    className={`px-3 py-2 rounded-input border text-left transition-colors ${liveMode === 'live'
+                                        ? 'border-brass bg-brass/15 text-ink'
+                                        : 'border-rule2 text-muted hover:border-brass/60 hover:text-ink2'
+                                        }`}
+                                >
+                                    <span className="block text-xs font-medium">🔴 Record Live</span>
+                                    <span className="block text-[11px] text-muted mt-0.5 leading-snug">
+                                        Next {liveDurationMinutes} min in real time · watches full live chat
+                                    </span>
+                                </button>
+                            </div>
+                        </div>
+                        <div>
+                            <p className="eyebrow mb-2">
+                                {liveMode === 'rewind' ? 'Grab last' : 'Record next'}
+                            </p>
+                            <div className="flex flex-wrap gap-1.5">
+                                {[2, 5, 10, 15, 30].map((mins) => {
+                                    const active = liveDurationMinutes === mins;
+                                    return (
+                                        <button
+                                            key={mins}
+                                            type="button"
+                                            onClick={() => setLiveDurationMinutes(mins)}
+                                            className={`px-3 py-1.5 rounded-full font-mono text-xs border transition-colors ${active
+                                                ? 'border-brass bg-brass/15 text-ink font-medium'
+                                                : 'border-rule2 text-muted hover:border-brass/60 hover:text-ink2'
+                                                }`}
+                                        >
+                                            {mins} min
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                        <label className="flex items-start gap-2 text-xs text-ink2 cursor-pointer select-none">
+                            <input
+                                type="checkbox"
+                                checked={watchLiveChat}
+                                onChange={(e) => setWatchLiveChat(e.target.checked)}
+                                className="mt-0.5 w-4 h-4 shrink-0 accent-[var(--color-accent)] cursor-pointer"
+                            />
+                            <span>
+                                <span className="font-medium text-ink">Use live chat for best moments</span>
+                                <span className="block text-[11px] text-muted mt-0.5 leading-relaxed">
+                                    {liveMode === 'rewind'
+                                        ? 'Pulls recent viewer chat spikes & reactions along with audio-first transcription while the video downloads.'
+                                        : `Tracks viewer chat spikes, reactions & Super Chats live during the ${liveDurationMinutes}-min capture.`}
+                                </span>
+                            </span>
+                        </label>
                     </div>
                 )}
 
@@ -429,7 +523,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         </>
                     ) : (
                         <>
-                            Generate Clips
+                            {mode === 'url' && urlPreview?.is_live
+                                ? (liveMode === 'rewind' ? `Clip Last ${liveDurationMinutes} Min of Live` : 'Record Live & Generate Clips')
+                                : 'Generate Clips'}
                         </>
                     )}
                 </button>

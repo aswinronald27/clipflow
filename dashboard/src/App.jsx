@@ -5,6 +5,7 @@ import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
+import DownloadProgressBar from './components/DownloadProgressBar';
 // import Gallery from './components/Gallery';
 import ThumbnailStudio from './components/ThumbnailStudio';
 import SaaShortsTab from './components/SaaShortsTab';
@@ -25,6 +26,7 @@ import LoginModal from './components/LoginModal';
 import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
 import HistoryTab from './components/HistoryTab';
+import JobsTab from './components/JobsTab';
 import AutopilotTab from './components/AutopilotTab';
 import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
@@ -383,6 +385,10 @@ function App() {
   const [logs, setLogs] = useState([]);
   // When each server log line arrived (epoch s, parallel to logs), from /api/status.
   const [logTimes, setLogTimes] = useState([]);
+  // Live yt-dlp download progress (percent, bytes, speed, eta, phase), from /api/status.
+  const [downloadProgress, setDownloadProgress] = useState(null);
+  const [cancellingJob, setCancellingJob] = useState(false);
+  const logsContainerRef = useRef(null);
   // Collapsed on phones: the log tail is the least useful thing on a 360px
   // screen and it was pushing the actual clips a full scroll down.
   const [logsVisible, setLogsVisible] = useState(() => {
@@ -617,6 +623,7 @@ function App() {
     setResults(data.result || null);
     setLogs(['♻️ Project restored from your library.']);
     setLogTimes([Date.now() / 1000]);
+    setDownloadProgress(null);
     setProcessingMedia(null);
     setQualityGate(null);
     setStatus('complete');
@@ -855,14 +862,30 @@ function App() {
 
           if (data.partial) setPartialJob(data.partial);
           setQueueInfo(data.status === 'queued' && data.queue ? data.queue : null);
+          if (data.download_progress) {
+            setDownloadProgress(data.download_progress);
+          }
 
           if (data.status === 'completed') {
             setQueueInfo(null);
+            setDownloadProgress(null);
             setStatus('complete');
+            clearInterval(interval);
+            refreshMe();
+          } else if (data.status === 'cancelled') {
+            setQueueInfo(null);
+            setDownloadProgress(null);
+            setStatus('error');
+            setJobError('Job was cancelled.');
+            if (data.logs) {
+              setLogs(data.logs);
+              setLogTimes(data.log_times || []);
+            }
             clearInterval(interval);
             refreshMe();
           } else if (data.status === 'failed') {
             setStatus('error');
+            setDownloadProgress(null);
             const errorMsg = data.error || (data.logs && data.logs.length > 0 ? data.logs[data.logs.length - 1] : "Process failed");
             setJobError(readableError(errorMsg));
             setLogs(prev => [...prev, "Error: " + errorMsg]);
@@ -888,7 +911,7 @@ function App() {
             if (historyAvailableRef.current) setActiveTab('history');
           }
         }
-      }, 2000);
+      }, 1000);
     }
     return () => clearInterval(interval);
   }, [status, jobId, refreshMe]);
@@ -1163,6 +1186,7 @@ function App() {
     setJobError('');
     setLogs(["Starting process..."]);
     setLogTimes([Date.now() / 1000]);
+    setDownloadProgress(data.type === 'url' ? { status: 'starting', percent: 0, downloaded_bytes: 0, total_bytes: 0 } : null);
     setResults(null);
     // Studio handovers have no local media object; the preview switches to the
     // backend-served source once the job id is known.
@@ -1197,6 +1221,10 @@ function App() {
         // The stretch picked under the cost line (seconds); absent = whole video.
         source_start: data.sourceStart ?? null,
         source_end: data.sourceEnd ?? null,
+        // Active YouTube Live capture options.
+        live_duration_minutes: data.liveDurationMinutes ?? null,
+        watch_live_chat: data.watchLiveChat ?? null,
+        live_mode: data.liveMode ?? null,
       };
 
       if (data.type === 'url') {
@@ -1331,6 +1359,7 @@ function App() {
     setResults(null);
     setLogs([]);
     setLogTimes([]);
+    setDownloadProgress(null);
     setProcessingMedia(null);
     setProjectState(null);
     setNoSource(false);
@@ -1344,6 +1373,67 @@ function App() {
     handleResetRef.current = handleReset;
   });
 
+  const handleCancelCurrentJob = async () => {
+    if (!jobId || cancellingJob) return;
+    setCancellingJob(true);
+    try {
+      await apiFetch(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
+      setStatus('error');
+      setQueueInfo(null);
+      setDownloadProgress(null);
+      setJobError('Job was cancelled.');
+      setLogs((prev) => [...prev, '⛔ Cancelled by user.']);
+    } catch (e) {
+      console.error('Cancel failed', e);
+    } finally {
+      setCancellingJob(false);
+    }
+  };
+
+  const openLocalJob = async (targetJobId) => {
+    flushClipState();
+    setJobGone(false);
+    setJobError('');
+    setProjectState(null);
+    setNoSource(false);
+    setPartialJob(null);
+    setFirstVideoJob(false);
+    setQueueInfo(null);
+    setJobId(targetJobId);
+    setProcessingMedia({ type: 'server', payload: `/api/source/${targetJobId}` });
+    setActiveTab('dashboard');
+    try {
+      const data = await apiJson(`/api/status/${targetJobId}`);
+      setLogs(data.logs || []);
+      setLogTimes(data.log_times || []);
+      setDownloadProgress(data.download_progress || null);
+      setResults(data.result || null);
+      if (data.status === 'completed') {
+        setStatus('complete');
+      } else if (data.status === 'cancelled') {
+        setStatus('error');
+        setJobError('Job was cancelled.');
+      } else if (data.status === 'failed') {
+        setStatus('error');
+        const lastErr = data.error || (data.logs?.length ? data.logs[data.logs.length - 1] : 'Process failed');
+        setJobError(readableError(lastErr));
+      } else {
+        setStatus('processing');
+        if (data.status === 'queued' && data.queue) setQueueInfo(data.queue);
+      }
+    } catch (e) {
+      setStatus('error');
+      setJobError('Could not load that job.');
+    }
+  };
+
+  // Keep System Logs scrolled to the latest line while processing.
+  useEffect(() => {
+    if (logsVisible && logsContainerRef.current) {
+      logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight;
+    }
+  }, [logs.length, logsVisible]);
+
   // --- UI Components ---
 
   // One nav definition drives all three surfaces: the desktop rail, the mobile
@@ -1351,6 +1441,8 @@ function App() {
   // wraps to two lines in a 5-up bar on a 360px phone.
   const navItems = [
     { id: 'dashboard', ord: '01', icon: LayoutDashboard, label: 'Clip Generator', short: 'clips', primary: true },
+    // Self-host Jobs manager (view all running, queued, completed & cancelled jobs).
+    ...(!billingEnabled ? [{ id: 'jobs', ord: '02', icon: Activity, label: 'Jobs', short: 'jobs', primary: true }] : []),
     // Cloud only: it runs on the managed pipeline and the Upload-Post connection.
     ...(billingEnabled ? [{ id: 'autopilot', ord: '02', icon: Rocket, label: 'Autopilot', short: 'autopilot', isNew: true }] : []),
     { id: 'saasshorts', ord: '03', icon: Sparkles, label: 'AI Shorts', short: 'ai shorts', byok: true, primary: true },
@@ -1592,14 +1684,27 @@ function App() {
               {activeNav?.label || 'openshorts'}
             </span>
             {status !== 'idle' && (
-              <button
-                onClick={handleReset}
-                className="btn-quiet px-3 py-1.5 text-xs shrink-0"
-                aria-label="New Project"
-              >
-                <Plus size={14} />
-                <span className="hidden sm:inline">New Project</span>
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={handleReset}
+                  className="btn-quiet px-3 py-1.5 text-xs shrink-0"
+                  aria-label="New Project"
+                >
+                  <Plus size={14} />
+                  <span className="hidden sm:inline">New Project</span>
+                </button>
+                {status === 'processing' && jobId && (
+                  <button
+                    onClick={handleCancelCurrentJob}
+                    disabled={cancellingJob}
+                    className="btn-danger px-3 py-1.5 text-xs shrink-0"
+                    aria-label="Cancel Job"
+                  >
+                    {cancellingJob ? <Loader2 size={14} className="animate-spin" /> : <X size={14} />}
+                    <span className="hidden sm:inline">Cancel Job</span>
+                  </button>
+                )}
+              </div>
             )}
           </div>
 
@@ -2121,6 +2226,15 @@ function App() {
             </div>
           )}
 
+          {/* View: Jobs (Self-hosted multi-job manager & cancel) */}
+          {activeTab === 'jobs' && (
+            <JobsTab
+              currentJobId={jobId}
+              onOpenJob={openLocalJob}
+              onNewProject={() => { handleReset(); setActiveTab('dashboard'); }}
+            />
+          )}
+
           {/* View: History */}
           {activeTab === 'history' && (
             <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
@@ -2290,6 +2404,11 @@ function App() {
                   />
                 )}
 
+                {/* Real-time Video Download Progress Bar */}
+                {status === 'processing' && !queueInfo && downloadProgress && (
+                  <DownloadProgressBar progress={downloadProgress} />
+                )}
+
                 {/* Phones only. The scan box drops its invented telemetry at
                     this size and the log terminal below starts collapsed, so
                     without this the screen would say nothing about what the job
@@ -2330,7 +2449,7 @@ function App() {
                     </span>
                   </button>
                   {logsVisible && (
-                    <div className="flex-1 p-3.5 sm:p-4 overflow-y-auto font-mono text-[11px] sm:text-xs space-y-1.5 custom-scrollbar text-muted break-words">
+                    <div ref={logsContainerRef} className="flex-1 p-3.5 sm:p-4 overflow-y-auto font-mono text-[11px] sm:text-xs space-y-1.5 custom-scrollbar text-muted break-words">
                       {logs.map((log, i) => (
                         <div key={i} className={`flex gap-2 ${log.toLowerCase().includes('error') ? 'text-danger' : 'text-muted'}`}>
                           <span className="text-muted opacity-50 shrink-0 hidden sm:inline tabular-nums">

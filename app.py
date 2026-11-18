@@ -1903,6 +1903,8 @@ _stopping = False                    # SIGTERM received: report not-ready so the
                                      # proxy stops routing here before the
                                      # listening socket closes
 _running_jobs: set = set()           # job ids with a live subprocess here
+_job_procs: Dict[str, subprocess.Popen] = {}
+_cancelled_jobs: set = set()         # job ids explicitly cancelled by the user
 
 
 # --- Remote CPU worker (remote_worker.py, worker.py) -------------------------
@@ -3144,7 +3146,7 @@ async def run_job_wrapper(job_id):
             if interrupted:
                 raise asyncio.CancelledError()
             return
-        if _should_auto_retry(job):
+        if _should_auto_retry(job) and job_id not in _cancelled_jobs and job.get('status') != 'cancelled':
             _schedule_auto_retry(job_id, job)
             _release_slot(job_id)
             print(f"🔁 Released slot for job {job_id} (auto-retry scheduled).")
@@ -4465,8 +4467,18 @@ def _handle_job_line(job_id, line, remote=False):
             _note_job_asr(decoded_line[8:])
         return
     if remote and decoded_line.startswith(("SOURCE_READY ", "PROXY_BYTES=", "PROXY_ROUTE=",
-                                           "YT_ACCOUNT_LIMITED")):
+                                           "YT_ACCOUNT_LIMITED", "DOWNLOAD_PROGRESS=")):
         return        # this host's own markers: the worker has no say in them
+    if decoded_line.startswith("DOWNLOAD_PROGRESS="):
+        # Structured download progress from main.py's yt-dlp hook.
+        # Consumed here (never appended to logs) so live updates never flood logs.
+        try:
+            payload = json.loads(decoded_line.split("=", 1)[1])
+            if isinstance(payload, dict) and job_id in jobs:
+                jobs[job_id]['download_progress'] = payload
+        except (ValueError, TypeError):
+            pass
+        return
     if decoded_line.startswith("SOURCE_READY "):
         # Internal marker of ``main.py --prepare-only``: where the source is.
         if job_id in jobs:
@@ -4604,6 +4616,10 @@ def _refresh_partial_result(job_id, output_dir):
 def _finish_job(job_id, returncode, output_dir):
     """main.py exited (here or on the remote worker): the job's final status
     and result, from the exit code and what is on disk."""
+    if job_id in _cancelled_jobs or (jobs.get(job_id) or {}).get('status') == 'cancelled':
+        if job_id in jobs:
+            jobs[job_id]['status'] = 'cancelled'
+        return
     if returncode == 0:
         jobs[job_id]['status'] = 'completed'
         jobs[job_id]['logs'].append("Process finished successfully.")
@@ -4664,35 +4680,44 @@ async def _run_main(job_id, cmd, env, tick=None):
         env=env,
         cwd=os.getcwd(),
         preexec_fn=_lower_priority,
+        start_new_session=True,
     )
+    _job_procs[job_id] = process
     # We need to capture logs in a thread because Popen isn't async
     t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
     t_log.daemon = True
     t_log.start()
 
     last_heartbeat = time.time()
-    while process.poll() is None:
-        try:
-            await asyncio.sleep(2)
-        except asyncio.CancelledError:
+    try:
+        while process.poll() is None:
             try:
-                process.kill()
-            except Exception:
-                pass
-            raise
-        if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
-            _touch_manifest(job_id)
-            last_heartbeat = time.time()
-        if tick is not None:
-            tick()
-    # The exit code can be read before the reader thread saw the last lines
-    # (SOURCE_READY is printed right before the exit).
-    await asyncio.to_thread(t_log.join, 5)
-    return process.returncode
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                raise
+            if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
+                _touch_manifest(job_id)
+                last_heartbeat = time.time()
+            if tick is not None:
+                tick()
+        # The exit code can be read before the reader thread saw the last lines
+        # (SOURCE_READY is printed right before the exit).
+        await asyncio.to_thread(t_log.join, 5)
+        return process.returncode
+    finally:
+        _job_procs.pop(job_id, None)
 
 
 async def run_job(job_id, job_data):
     """Executes the subprocess for a specific job."""
+    if job_id in _cancelled_jobs or job_data.get('status') == 'cancelled':
+        job_data['status'] = 'cancelled'
+        _clear_resume_manifest(job_id)
+        return
     if job_id in _remote_jobs:
         return await _run_job_remote(job_id, job_data)
 
@@ -5391,6 +5416,71 @@ class EstimateRequest(BaseModel):
     seconds: Optional[float] = None  # a local file: the browser read its duration
 
 
+class UrlPreviewRequest(BaseModel):
+    url: str
+
+
+_url_preview_cache: dict = {}
+_URL_PREVIEW_TTL = 600
+
+
+@app.post("/api/url-preview")
+async def url_preview(req: UrlPreviewRequest, request: Request):
+    """Lightweight pre-submit preview of a video URL: estimated download size,
+    resolution, duration, and title — before the user clicks Generate."""
+    url = (req.url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="URL is required.")
+    from security_utils import assert_public_url
+    from yt_clients import youtube_non_video_reason
+    try:
+        assert_public_url(url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    reason = youtube_non_video_reason(url)
+    if reason:
+        return {"ok": False, "error": f"This link is {reason}."}
+
+    now = time.monotonic()
+    cached = _url_preview_cache.get(url)
+    if cached and now - cached[0] <= _URL_PREVIEW_TTL:
+        return cached[1]
+
+    # Evict stale entries to keep the cache tiny.
+    for k in [k for k, v in _url_preview_cache.items() if now - v[0] > _URL_PREVIEW_TTL]:
+        _url_preview_cache.pop(k, None)
+
+    client_key = request.client.host if request.client else "local"
+    if BILLING_ENABLED:
+        try:
+            user = await _user_from_request(request)
+            if user is not None:
+                client_key = str(user.id)
+        except Exception:
+            pass
+    _check_probe_rate(f"preview:{client_key}")
+
+    info = await _probe_youtube_quality(url)
+    max_h = int(info.get("max_height") or 0)
+    picked_h = int(info.get("picked_height") or (min(max_h, 1080) if max_h else 0))
+    est_bytes = info.get("estimated_bytes")
+    duration = int(info.get("duration") or 0)
+    is_live = bool(info.get("is_live", False))
+    preview = {
+        "ok": bool(est_bytes or duration or max_h or is_live),
+        "title": str(info.get("title") or "")[:160],
+        "duration": duration,
+        "height": picked_h,
+        "max_height": max_h,
+        "estimated_bytes": int(est_bytes) if isinstance(est_bytes, (int, float)) and est_bytes > 0 else None,
+        "is_estimate": bool(info.get("size_is_estimate", True)),
+        "is_live": is_live,
+    }
+    if preview["ok"]:
+        _url_preview_cache[url] = (now, preview)
+    return preview
+
+
 @app.post("/api/process/estimate")
 async def process_estimate(req: EstimateRequest, request: Request):
     """Cost line for the dashboard: what this source would cost before it runs.
@@ -5460,6 +5550,9 @@ async def process_endpoint(
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
+    live_duration_minutes: Optional[str] = Form(None),
+    watch_live_chat: Optional[str] = Form(None),
+    live_mode: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -5494,6 +5587,9 @@ async def process_endpoint(
         max_minutes = body.get("max_minutes")
         source_start = body.get("source_start")
         source_end = body.get("source_end")
+        live_duration_minutes = body.get("live_duration_minutes")
+        watch_live_chat = body.get("watch_live_chat")
+        live_mode = body.get("live_mode")
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -5742,6 +5838,18 @@ async def process_endpoint(
     # metering step (entitlement, job limit, balance, the hourly probe cap), so
     # an account with no minutes cannot use it as a free yt-dlp runner; a
     # rejection hands the reservation back.
+    if url and live_duration_minutes is not None:
+        try:
+            live_mins = max(1.0, min(60.0, float(live_duration_minutes)))
+            env["LIVE_DURATION_SECONDS"] = str(int(round(live_mins * 60)))
+        except (TypeError, ValueError):
+            pass
+    if url and watch_live_chat is not None:
+        watch_flag = str(watch_live_chat).lower() not in ("0", "false", "no", "off")
+        env["WATCH_LIVE_CHAT"] = "1" if watch_flag else "0"
+    if url and live_mode in ("rewind", "live"):
+        env["LIVE_MODE"] = live_mode
+
     if url and (QUALITY_GATE_MIN_HEIGHT > 0 or MIN_SOURCE_SECONDS > 0):
         try:
             gate = await _quality_gate(url, force_low)
@@ -5789,6 +5897,8 @@ async def process_endpoint(
         'cmd': cmd,
         'env': env,
         'output_dir': job_output_dir,
+        'source': url or (os.path.basename(input_path) if input_path else 'upload'),
+        'created_at': time.time(),
         'attestation': attestation,
         'user_id': user_id,
         'reservation_id': reservation_id,
@@ -5935,6 +6045,8 @@ async def get_status(job_id: str, request: Request):
         # Set when only the first part of the source was clipped (quota wall
         # offer), so the dashboard can say so next to the clips.
         "partial": job.get('partial'),
+        # Live yt-dlp download progress (bytes, percent, speed, eta, phase).
+        "download_progress": job.get('download_progress'),
     }
 
 
@@ -6057,6 +6169,190 @@ async def get_source_video(job_id: str, request: Request,
     if not source_path:
         raise HTTPException(status_code=404, detail="Source not found")
     return FileResponse(source_path, media_type="video/mp4")
+
+
+def _terminate_job_proc(job_id: str) -> bool:
+    """Terminate a running job subprocess (and its child ffmpeg/deno group)."""
+    proc = _job_procs.get(job_id)
+    if proc is None or proc.poll() is not None:
+        return False
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    return True
+
+
+def _summarize_job(job_id: str, job: dict) -> dict:
+    """Compact summary row for GET /api/jobs."""
+    res = job.get('result') or {}
+    clips = res.get('clips') or []
+    logs = list(job.get('logs') or [])
+    output_dir = job.get('output_dir') or os.path.join(OUTPUT_DIR, job_id)
+    title = job.get('title') or ''
+    if not title and os.path.isdir(output_dir):
+        metas = glob.glob(os.path.join(output_dir, '*_metadata.json'))
+        if metas:
+            title = os.path.basename(metas[0]).replace('_metadata.json', '').replace('_', ' ')
+        else:
+            mp4s = [
+                f for f in os.listdir(output_dir)
+                if f.endswith('.mp4') and not f.startswith('.')
+            ]
+            if mp4s:
+                title = os.path.splitext(mp4s[0])[0].replace('_', ' ')
+    source = job.get('source') or _job_source_url(job) or ''
+    if not title:
+        title = source or job_id[:8]
+    created_at = job.get('created_at')
+    if not created_at:
+        try:
+            created_at = os.path.getmtime(output_dir) if os.path.exists(output_dir) else time.time()
+        except OSError:
+            created_at = time.time()
+    return {
+        "job_id": job_id,
+        "status": _presented_status(job_id, job),
+        "title": title,
+        "source": source,
+        "created_at": created_at,
+        "clips_count": len(clips),
+        "download_progress": job.get('download_progress'),
+        "cost_analysis": res.get('cost_analysis'),
+        "last_log": logs[-1] if logs else "",
+    }
+
+
+def _scan_disk_job_summary(job_id: str) -> Optional[dict]:
+    """Build a summary row for a job folder on disk that is no longer in memory."""
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isdir(output_dir):
+        return None
+    try:
+        mtime = os.path.getmtime(output_dir)
+    except OSError:
+        mtime = 0.0
+    metas = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    cancelled_marker = os.path.join(output_dir, ".cancelled")
+    if metas:
+        try:
+            with open(metas[0], "r", encoding="utf-8") as f:
+                data = json.load(f)
+            base = os.path.basename(metas[0]).replace("_metadata.json", "")
+            clips = data.get("shorts") or []
+            rendered, _missing = _clips_actually_rendered(job_id, output_dir, base, clips)
+            return {
+                "job_id": job_id,
+                "status": "completed" if rendered else "failed",
+                "title": base.replace("_", " "),
+                "source": data.get("source_video") or "",
+                "created_at": mtime,
+                "clips_count": len(rendered),
+                "download_progress": None,
+                "cost_analysis": data.get("cost_analysis"),
+                "last_log": f"{len(rendered)} clip(s) ready" if rendered else "No clips rendered",
+            }
+        except Exception:
+            pass
+    mp4s = [f for f in os.listdir(output_dir) if f.endswith(".mp4") and not f.startswith(".")]
+    title = os.path.splitext(mp4s[0])[0].replace("_", " ") if mp4s else job_id[:8]
+    status = "cancelled" if os.path.exists(cancelled_marker) else "failed"
+    return {
+        "job_id": job_id,
+        "status": status,
+        "title": title,
+        "source": mp4s[0] if mp4s else "",
+        "created_at": mtime,
+        "clips_count": 0,
+        "download_progress": None,
+        "cost_analysis": None,
+        "last_log": "Cancelled by user." if status == "cancelled" else "Stopped before clips finished.",
+    }
+
+
+@app.get("/api/jobs")
+async def list_jobs(request: Request):
+    """List all jobs (active, queued, completed, cancelled, failed) for the Jobs dashboard."""
+    owner_id = None
+    if BILLING_ENABLED:
+        user = await _user_from_request(request)
+        if user is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        owner_id = str(user.id)
+
+    seen = set()
+    rows = []
+    for jid, job in list(jobs.items()):
+        if owner_id is not None and str(job.get("user_id") or "") != owner_id:
+            continue
+        seen.add(jid)
+        rows.append(_summarize_job(jid, job))
+
+    # Also include finished / cancelled folders on disk (self-host convenience).
+    if owner_id is None and os.path.isdir(OUTPUT_DIR):
+        try:
+            for name in os.listdir(OUTPUT_DIR):
+                if name in seen or name.startswith(".") or name == "thumbnails":
+                    continue
+                if not os.path.isdir(os.path.join(OUTPUT_DIR, name)):
+                    continue
+                row = _scan_disk_job_summary(name)
+                if row is not None:
+                    rows.append(row)
+        except OSError:
+            pass
+
+    rows.sort(key=lambda r: float(r.get("created_at") or 0), reverse=True)
+    active_count = sum(1 for r in rows if r["status"] in ("processing", "queued"))
+    return {
+        "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
+        "active_count": active_count,
+        "jobs": rows[:100],
+    }
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str, request: Request):
+    """Cancel a running or queued job, kill its subprocess, and free the worker slot."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{4,128}", job_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid job_id")
+    job = jobs.get(job_id)
+    if job is not None:
+        await _assert_job_owner(request, job)
+    elif BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    _cancelled_jobs.add(job_id)
+    _clear_resume_manifest(job_id)
+
+    output_dir = (job.get('output_dir') if job else None) or os.path.join(OUTPUT_DIR, job_id)
+    if os.path.isdir(output_dir):
+        try:
+            with open(os.path.join(output_dir, ".cancelled"), "w") as f:
+                f.write(str(time.time()))
+        except OSError:
+            pass
+
+    if job is not None:
+        if job.get('status') not in ('completed',):
+            job['status'] = 'cancelled'
+            job['logs'].append("⛔ Cancelled by user.")
+    killed = _terminate_job_proc(job_id)
+    print(f"⛔ [cancel] job={job_id} killed_proc={killed}", flush=True)
+    return {"ok": True, "job_id": job_id, "status": "cancelled", "killed": killed}
 
 
 @app.get("/api/jobs/{job_id}/download-all")

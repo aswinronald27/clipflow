@@ -271,23 +271,42 @@ def _remember_probe(url, info):
         height = max(heights, default=0)
         if not height:
             return            # nothing to say about quality: let the gate ask
+        from quality_probe import estimate_download_size
+        est_bytes, size_is_est, picked_h = estimate_download_size(info)
         now = time.time()
         for k in [k for k, v in _probe_facts.items() if now - v["at"] > _PROBE_FACTS_TTL]:
             _probe_facts.pop(k, None)
-        _probe_facts[url] = {"at": now, "max_height": int(height),
-                             "duration": int(info.get("duration") or 0)}
+        _probe_facts[url] = {
+            "at": now,
+            "max_height": int(height),
+            "duration": int(info.get("duration") or 0),
+            "estimated_bytes": est_bytes,
+            "size_is_estimate": bool(size_is_est),
+            "picked_height": int(picked_h or min(int(height), 1080)),
+            "title": str(info.get("title") or "")[:160],
+            "is_live": bool(info.get("is_live") or info.get("live_status") == "is_live"),
+        }
     except Exception:
         pass
 
 
 def probe_facts(url):
-    """``{max_height, duration, mode, cookies_invalid}`` from a probe of this
+    """``{max_height, duration, mode, cookies_invalid, ...}`` from a probe of this
     URL in the last few minutes, or None."""
     f = _probe_facts.get(url)
     if not f or time.time() - f["at"] > _PROBE_FACTS_TTL:
         return None
-    return {"max_height": f["max_height"], "duration": f["duration"],
-            "mode": "metering-probe", "cookies_invalid": False}
+    return {
+        "max_height": f["max_height"],
+        "duration": f["duration"],
+        "mode": "metering-probe",
+        "cookies_invalid": False,
+        "estimated_bytes": f.get("estimated_bytes"),
+        "size_is_estimate": f.get("size_is_estimate", True),
+        "picked_height": f.get("picked_height", 0),
+        "title": f.get("title", ""),
+        "is_live": f.get("is_live", False),
+    }
 
 
 def _probe_with_proxies(url, proxies, strategies, static_errors, paid, ck_path):
