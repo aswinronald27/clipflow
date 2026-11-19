@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket } from 'lucide-react';
+import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket, Clock, FileVideo } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
@@ -370,6 +370,84 @@ function App() {
   const [jobId, setJobId] = useState(null);
   const [status, setStatus] = useState('idle'); // idle, processing, complete, error
   const [results, setResults] = useState(null);
+
+  // Multi-project Tabs Bar: tracks all open / recent video jobs
+  const [projectTabs, setProjectTabs] = useState(() => {
+    try {
+      const saved = localStorage.getItem('os_project_tabs');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('os_project_tabs', JSON.stringify(projectTabs.slice(0, 15)));
+    } catch { /* ignore */ }
+  }, [projectTabs]);
+
+  // Keep active job synced with open project tabs
+  useEffect(() => {
+    if (!jobId) return;
+    setProjectTabs((prev) => {
+      const normStatus = status === 'completed' ? 'complete' : status;
+      if (prev.some((t) => t.id === jobId)) {
+        return prev.map((t) => (t.id === jobId ? { ...t, status: normStatus } : t));
+      }
+      return [...prev, { id: jobId, title: `Job ${jobId.slice(0, 8)}`, status: normStatus }];
+    });
+  }, [jobId, status]);
+
+  // Poll background job statuses to keep tabs live
+  useEffect(() => {
+    if (!projectTabs.length) return undefined;
+    const updateTabStatuses = async () => {
+      try {
+        const res = await apiJson('/api/jobs');
+        const jobList = res?.jobs || [];
+        const statusMap = new Map(jobList.map((j) => [j.id, j]));
+        setProjectTabs((prev) =>
+          prev.map((tab) => {
+            const found = statusMap.get(tab.id);
+            if (!found) return tab;
+            const updatedStatus = found.status === 'completed' ? 'complete' : found.status;
+            return {
+              ...tab,
+              status: updatedStatus,
+              title: tab.title || found.source || `Job ${tab.id.slice(0, 8)}`,
+            };
+          })
+        );
+      } catch { /* ignore */ }
+    };
+    const interval = setInterval(updateTabStatuses, 4000);
+    return () => clearInterval(interval);
+  }, [projectTabs.length]);
+
+  const handleNewVideoTab = () => {
+    flushClipState();
+    setStatus('idle');
+    setJobId(null);
+    setResults(null);
+    setLogs([]);
+    setLogTimes([]);
+    setDownloadProgress(null);
+    setProcessingMedia(null);
+    setProjectState(null);
+    setNoSource(false);
+    setPartialJob(null);
+    setFirstVideoJob(false);
+    setQueueInfo(null);
+    setJobError('');
+  };
+
+  const handleCloseTab = (tabIdToClose) => {
+    setProjectTabs((prev) => prev.filter((t) => t.id !== tabIdToClose));
+    if (jobId === tabIdToClose) {
+      handleNewVideoTab();
+    }
+  };
   // Best clips first. The backend hands them back in transcript order, which
   // buries the strongest one wherever it happens to fall in the video — and
   // the first card is the one people actually watch and publish.
@@ -1374,6 +1452,12 @@ function App() {
       setJobId(resData.job_id);
       setPartialJob(resData.partial || null);
       setFirstVideoJob(!!resData.first_video);
+      const newTitle = data.type === 'file' ? (data.payload?.name || 'Uploaded Video') : (data.payload || 'Video');
+      setProjectTabs((prev) => {
+        const cleanTitle = newTitle.length > 25 ? `${newTitle.slice(0, 22)}...` : newTitle;
+        const filtered = prev.filter((t) => t.id !== resData.job_id);
+        return [{ id: resData.job_id, title: cleanTitle, status: 'processing' }, ...filtered];
+      });
       // The server clipped past the balance on its own (no wall): the first
       // video whole, or the first N minutes of a later one.
       if (resData.first_video) track('FirstVideoGrant');
@@ -1557,6 +1641,14 @@ function App() {
       setLogTimes(data.log_times || []);
       setDownloadProgress(data.download_progress || null);
       setResults(data.result || null);
+      setProjectTabs((prev) => {
+        const normStatus = data.status === 'completed' ? 'complete' : data.status;
+        const jobTitle = data.source || `Job ${targetJobId.slice(0, 8)}`;
+        if (prev.some((t) => t.id === targetJobId)) {
+          return prev.map((t) => (t.id === targetJobId ? { ...t, status: normStatus, title: t.title || jobTitle } : t));
+        }
+        return [{ id: targetJobId, title: jobTitle, status: normStatus }, ...prev];
+      });
       if (data.status === 'completed') {
         setStatus('complete');
       } else if (data.status === 'cancelled') {
@@ -1922,6 +2014,72 @@ function App() {
             )}
           </div>
         </header>
+
+        {/* Horizontal Project Tabs Bar (Browser-like tabs for multiple videos) */}
+        {activeTab === 'dashboard' && (
+          <div className="h-10 border-b border-rule bg-paper2/75 flex items-center gap-1 px-3 sm:px-6 shrink-0 overflow-x-auto custom-scrollbar">
+            {/* '+ New Video' Tab */}
+            <button
+              type="button"
+              onClick={handleNewVideoTab}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-t text-xs font-medium border-b-2 transition-all shrink-0 cursor-pointer ${
+                status === 'idle' && !jobId
+                  ? 'border-brass text-ink bg-paper shadow-sm font-semibold'
+                  : 'border-transparent text-muted hover:text-ink hover:bg-paper3'
+              }`}
+            >
+              <Plus size={13} className="text-brass" />
+              <span>+ New Video</span>
+            </button>
+
+            {/* Open Video Project Tabs */}
+            {projectTabs.map((tab) => {
+              const isCurrent = jobId === tab.id;
+              const isProc = tab.status === 'processing';
+              const isQueued = tab.status === 'queued';
+              const isDone = tab.status === 'complete' || tab.status === 'completed';
+              const isFail = tab.status === 'error' || tab.status === 'failed';
+
+              return (
+                <div
+                  key={tab.id}
+                  onClick={() => openLocalJob(tab.id)}
+                  className={`group flex items-center gap-2 px-3 py-1.5 rounded-t text-xs font-medium border-b-2 cursor-pointer transition-all shrink-0 max-w-[210px] select-none ${
+                    isCurrent
+                      ? 'border-brass text-ink bg-paper shadow-sm font-semibold'
+                      : 'border-transparent text-muted hover:text-ink hover:bg-paper3'
+                  }`}
+                >
+                  {isProc ? (
+                    <Loader2 size={12} className="animate-spin text-brass shrink-0" />
+                  ) : isQueued ? (
+                    <Clock size={12} className="text-warn shrink-0" />
+                  ) : isDone ? (
+                    <CheckCircle2 size={12} className="text-ok shrink-0" />
+                  ) : isFail ? (
+                    <AlertTriangle size={12} className="text-danger shrink-0" />
+                  ) : (
+                    <FileVideo size={12} className="shrink-0 text-muted" />
+                  )}
+
+                  <span className="truncate">{tab.title || `Job ${tab.id.slice(0, 8)}`}</span>
+
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleCloseTab(tab.id);
+                    }}
+                    className="p-0.5 rounded-full hover:bg-paper3 hover:text-ink text-muted opacity-60 group-hover:opacity-100 transition-opacity"
+                    title="Close tab"
+                  >
+                    <X size={11} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
 
         {/* Persistent Missing Keys Banner — visible on every screen */}
         {keysMissing && activeTab !== 'settings' && (
