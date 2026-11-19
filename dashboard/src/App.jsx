@@ -287,6 +287,14 @@ const pollJob = async (jobId) => {
   return res.json();
 };
 
+function formatTabTitle(title, id) {
+  if (!title) return id ? `Job ${id.slice(0, 8)}` : 'Video';
+  let clean = String(title).replace(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_?/i, '');
+  clean = clean.replace(/(\.mp4|\.mov|\.mkv|\.webm)$/i, '');
+  clean = clean.replace(/_/g, ' ').trim();
+  return clean.length > 25 ? `${clean.slice(0, 22)}...` : (clean || `Job ${id ? id.slice(0, 8) : ''}`);
+}
+
 function App() {
   // Cloud auth/billing session (inert when billing is disabled).
   const { billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds, localLlm, loading: authLoading } = useAuth();
@@ -395,35 +403,75 @@ function App() {
       if (prev.some((t) => t.id === jobId)) {
         return prev.map((t) => (t.id === jobId ? { ...t, status: normStatus } : t));
       }
-      return [...prev, { id: jobId, title: `Job ${jobId.slice(0, 8)}`, status: normStatus }];
+      return [{ id: jobId, title: `Job ${jobId.slice(0, 8)}`, status: normStatus }, ...prev];
     });
   }, [jobId, status]);
 
-  // Poll background job statuses to keep tabs live
+  // Sync with backend /api/jobs to ensure active and recent jobs are always visible as tabs
   useEffect(() => {
-    if (!projectTabs.length) return undefined;
-    const updateTabStatuses = async () => {
+    let cancelled = false;
+    const syncJobs = async () => {
       try {
         const res = await apiJson('/api/jobs');
+        if (cancelled) return;
         const jobList = res?.jobs || [];
-        const statusMap = new Map(jobList.map((j) => [j.id, j]));
-        setProjectTabs((prev) =>
-          prev.map((tab) => {
-            const found = statusMap.get(tab.id);
-            if (!found) return tab;
-            const updatedStatus = found.status === 'completed' ? 'complete' : found.status;
-            return {
-              ...tab,
-              status: updatedStatus,
-              title: tab.title || found.source || `Job ${tab.id.slice(0, 8)}`,
-            };
-          })
-        );
+        if (!jobList.length) return;
+
+        setProjectTabs((prev) => {
+          const prevMap = new Map(prev.map((t) => [t.id, t]));
+          const updated = [];
+
+          // 1. Refresh existing tabs with latest backend status and title
+          for (const t of prev) {
+            const match = jobList.find((j) => j.job_id === t.id);
+            if (match) {
+              const normStatus = match.status === 'completed' ? 'complete' : match.status;
+              updated.push({
+                ...t,
+                status: normStatus,
+                title: t.title || formatTabTitle(match.title || match.source, match.job_id),
+              });
+            } else {
+              updated.push(t);
+            }
+          }
+
+          // 2. Automatically pull in active jobs (processing or queued) not yet in tabs
+          for (const j of jobList) {
+            if ((j.status === 'processing' || j.status === 'queued') && !prevMap.has(j.job_id)) {
+              const normStatus = j.status === 'completed' ? 'complete' : j.status;
+              updated.unshift({
+                id: j.job_id,
+                title: formatTabTitle(j.title || j.source, j.job_id),
+                status: normStatus,
+              });
+            }
+          }
+
+          // 3. If tabs are completely empty, populate with the latest jobs
+          if (updated.length === 0) {
+            for (const j of jobList.slice(0, 3)) {
+              const normStatus = j.status === 'completed' ? 'complete' : j.status;
+              updated.push({
+                id: j.job_id,
+                title: formatTabTitle(j.title || j.source, j.job_id),
+                status: normStatus,
+              });
+            }
+          }
+
+          return updated.slice(0, 12);
+        });
       } catch { /* ignore */ }
     };
-    const interval = setInterval(updateTabStatuses, 4000);
-    return () => clearInterval(interval);
-  }, [projectTabs.length]);
+
+    syncJobs();
+    const interval = setInterval(syncJobs, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
 
   const handleNewVideoTab = () => {
     flushClipState();
@@ -443,10 +491,17 @@ function App() {
   };
 
   const handleCloseTab = (tabIdToClose) => {
-    setProjectTabs((prev) => prev.filter((t) => t.id !== tabIdToClose));
-    if (jobId === tabIdToClose) {
-      handleNewVideoTab();
-    }
+    setProjectTabs((prev) => {
+      const remaining = prev.filter((t) => t.id !== tabIdToClose);
+      if (jobId === tabIdToClose) {
+        if (remaining.length > 0) {
+          openLocalJob(remaining[0].id);
+        } else {
+          handleNewVideoTab();
+        }
+      }
+      return remaining;
+    });
   };
   // Best clips first. The backend hands them back in transcript order, which
   // buries the strongest one wherever it happens to fall in the video — and

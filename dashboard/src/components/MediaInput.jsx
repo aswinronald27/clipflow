@@ -42,7 +42,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [file, setFile] = useState(null);
     const [fileSeconds, setFileSeconds] = useState(null);
     const fileTooShort = fileSeconds != null && fileSeconds < MIN_SOURCE_SECONDS;
-    const [acknowledged, setAcknowledged] = useState(false);
+    const [acknowledged, setAcknowledged] = useState(() => {
+        try { return localStorage.getItem('os_acknowledged') !== '0'; } catch { return true; }
+    });
     // {start, end} in seconds when the user picked a stretch under the cost line.
     const [range, setRange] = useState(null);
     // Pre-submit preview returned by /api/url-preview (size, resolution, is_live).
