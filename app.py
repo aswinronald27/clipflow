@@ -50,7 +50,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
-MAX_FILE_SIZE_MB = 2048  # 2GB limit
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50000"))  # 50GB default for self-host
 
 # How TikTok receives our uploads. MEDIA_UPLOAD lands the video in the user's
 # TikTok drafts so they finish the post inside TikTok's own editor; DIRECT_POST
@@ -64,7 +64,7 @@ TIKTOK_POST_MODE = os.environ.get("TIKTOK_POST_MODE", "MEDIA_UPLOAD").strip()
 # Ceiling for the working directory once it lives on a persistent volume: the
 # age-based sweep alone can't stop a burst of long videos from filling the disk.
 # 0 disables the cap.
-OUTPUT_MAX_GB = int(os.environ.get("OUTPUT_MAX_GB", "25"))
+OUTPUT_MAX_GB = int(os.environ.get("OUTPUT_MAX_GB", "100"))
 # A job dir touched this recently is left alone by the size cap. Where the
 # jobs still queued or running hold more than the cap by themselves, the cap
 # purged every finished job at the next sweep: an edit made minutes after the
@@ -72,7 +72,7 @@ OUTPUT_MAX_GB = int(os.environ.get("OUTPUT_MAX_GB", "25"))
 # project restored from the library was purged again while it was open.
 OUTPUT_CAP_GRACE_SECONDS = int(os.environ.get("OUTPUT_CAP_GRACE_SECONDS", "1800"))
 # Same idea for source uploads, which are the biggest single files on disk.
-UPLOADS_MAX_GB = int(os.environ.get("UPLOADS_MAX_GB", "15"))
+UPLOADS_MAX_GB = int(os.environ.get("UPLOADS_MAX_GB", "100"))
 # Pre-flight quality gate: warn before processing a YouTube source below this
 # height (0 disables). Only applies to URLs; uploads are whatever the user gave.
 QUALITY_GATE_MIN_HEIGHT = int(os.environ.get("QUALITY_GATE_MIN_HEIGHT", "720"))
@@ -589,7 +589,27 @@ async def reserve_process_minutes(request, url, input_path, job_id, max_minutes=
     on the operator's key for free. Only skip metering when billing is off.
     """
     if not BILLING_ENABLED:
-        return None, 2, None, None, None
+        partial = None
+        if source_range:
+            try:
+                start_raw, end_raw = source_range
+                s_val = float(start_raw) if start_raw not in (None, "") else 0.0
+                e_val = float(end_raw) if end_raw not in (None, "") else None
+                if e_val is not None and e_val > s_val:
+                    partial = {
+                        "processed_minutes": round((e_val - s_val) / 60.0, 4),
+                        "start_seconds": round(s_val, 3),
+                        "end_seconds": round(e_val, 3),
+                        "chosen": True,
+                    }
+                elif s_val > 0:
+                    partial = {
+                        "start_seconds": round(s_val, 3),
+                        "chosen": True,
+                    }
+            except (TypeError, ValueError):
+                pass
+        return None, 2, None, None, partial
     user = await _user_from_request(request)
     if not managed_keys.has_active_entitlement(user):
         return None, 2, None, None, None  # shouldn't happen (resolve_gemini would have 402'd)

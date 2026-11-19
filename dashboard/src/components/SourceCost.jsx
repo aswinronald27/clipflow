@@ -26,7 +26,7 @@ const clock = (seconds) => {
 
 const looksLikeUrl = (u) => /^https?:\/\/\S+\.\S+/.test((u || '').trim());
 
-export default function SourceCost({ mode, url, fileSeconds, range, onRangeChange }) {
+export default function SourceCost({ mode, url, fileSeconds, urlDuration, range, onRangeChange }) {
     const { isManaged } = useAuth();
     const [estimate, setEstimate] = useState(null);
     const [loading, setLoading] = useState(false);
@@ -64,9 +64,77 @@ export default function SourceCost({ mode, url, fileSeconds, range, onRangeChang
         return () => { cancelled = true; clearTimeout(t); };
         // onRangeChange is a setState from the parent: stable.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [isManaged, mode, url, fileSeconds]);
+    }, [isManaged, mode, url, fileSeconds, urlDuration]);
 
-    if (!isManaged) return null;
+    if (!isManaged) {
+        const total = mode === 'file' ? fileSeconds : (urlDuration || null);
+        if (!total || total < MIN_RANGE_SECONDS * 2) return null;
+
+        const start = range ? range.start : 0;
+        const end = range ? range.end : total;
+        const setStart = (v) => onRangeChange({ start: Math.min(v, end - MIN_RANGE_SECONDS), end });
+        const setEnd = (v) => onRangeChange({ start, end: Math.max(v, start + MIN_RANGE_SECONDS) });
+
+        return (
+            <div className="mt-3 text-xs leading-relaxed">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                    <span className="text-ink2">
+                        {range ? `${clock(start)}–${clock(end)} of ${clock(total)} selected` : `${clock(total)} video`}
+                    </span>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            if (picking || range) {
+                                setPicking(false);
+                                onRangeChange(null);
+                                return;
+                            }
+                            setPicking(true);
+                            onRangeChange({ start: 0, end: total });
+                        }}
+                        className="flex items-center gap-1 text-brass hover:underline lowercase cursor-pointer"
+                    >
+                        <Scissors size={12} />
+                        {picking || range ? 'clip the whole video' : 'clip only part of it'}
+                    </button>
+                </div>
+                {(picking || range) && range && (
+                    <div className="mt-3 space-y-2 animate-fade">
+                        <label className="block">
+                            <span className="flex justify-between">
+                                <span className="eyebrow">from</span>
+                                <span className="readout">{clock(start)}</span>
+                            </span>
+                            <input
+                                type="range"
+                                min="0"
+                                max={Math.max(0, total - MIN_RANGE_SECONDS)}
+                                step={STEP_SECONDS}
+                                value={start}
+                                onChange={(e) => setStart(Number(e.target.value))}
+                                className="w-full accent-[var(--color-accent)]"
+                            />
+                        </label>
+                        <label className="block">
+                            <span className="flex justify-between">
+                                <span className="eyebrow">to</span>
+                                <span className="readout">{clock(end)}</span>
+                            </span>
+                            <input
+                                type="range"
+                                min={MIN_RANGE_SECONDS}
+                                max={total}
+                                step={STEP_SECONDS}
+                                value={end}
+                                onChange={(e) => setEnd(Number(e.target.value))}
+                                className="w-full accent-[var(--color-accent)]"
+                            />
+                        </label>
+                    </div>
+                )}
+            </div>
+        );
+    }
     if (loading && !estimate) {
         return (
             <p className="mt-3 flex items-center gap-2 text-xs text-muted">
