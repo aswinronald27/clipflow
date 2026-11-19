@@ -224,16 +224,38 @@ def run_whisper_transcription(media_path, **params):
     models, so a job must degrade instead of dying when VRAM runs out.
     """
     global _whisper_model, _whisper_force_cpu
+    audio_path = media_path
+    cleanup_audio = False
+    ext = os.path.splitext(media_path)[1].lower()
+    if ext not in ('.wav', '.mp3', '.aac', '.m4a', '.flac', '.ogg'):
+        tmp_wav = os.path.join(tempfile.gettempdir(), f"asr_{os.getpid()}_{int(time.time()*1000)}.wav")
+        try:
+            cmd = ["ffmpeg", "-y", "-i", media_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", tmp_wav]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 0:
+                audio_path = tmp_wav
+                cleanup_audio = True
+        except Exception as e:
+            print(f"⚠️ [ASR] audio extraction fallback to direct container ({e})")
+            audio_path = media_path
+
     try:
-        return _run_whisper_once(media_path, **params)
-    except RuntimeError as e:
-        if _whisper_force_cpu or "cuda" not in str(e).lower():
-            raise
-        print(f"⚠️ [ASR] whisper GPU failed ({e}) — retrying on CPU", flush=True)
-        _whisper_force_cpu = True
-        with _whisper_lock:
-            _whisper_model = None  # drop the GPU model to release its VRAM
-        return _run_whisper_once(media_path, **params)
+        try:
+            return _run_whisper_once(audio_path, **params)
+        except RuntimeError as e:
+            if _whisper_force_cpu or "cuda" not in str(e).lower():
+                raise
+            print(f"⚠️ [ASR] whisper GPU failed ({e}) — retrying on CPU", flush=True)
+            _whisper_force_cpu = True
+            with _whisper_lock:
+                _whisper_model = None  # drop the GPU model to release its VRAM
+            return _run_whisper_once(audio_path, **params)
+    finally:
+        if cleanup_audio and os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
 
 
 def _transcribe_with_whisper(media_path):

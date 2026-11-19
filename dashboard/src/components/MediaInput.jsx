@@ -80,6 +80,8 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [layout, setLayout] = useState(() => {
         try { return localStorage.getItem('os_layout') || 'screencast'; } catch { return 'screencast'; }
     });
+    const [customStartMin, setCustomStartMin] = useState('');
+    const [customDurationMin, setCustomDurationMin] = useState('');
     const infoRef = useRef(null);
 
     // Close the compatibility popover on any outside click.
@@ -136,6 +138,11 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const handleSubmit = (e) => {
         e.preventDefault();
         if (!acknowledged) return;
+        const startSec = range ? Math.round(range.start) : (customStartMin ? Math.round(Number(customStartMin) * 60) : null);
+        const durSec = range ? Math.round(range.end - range.start) : (customDurationMin ? Math.round(Number(customDurationMin) * 60) : null);
+        const endSec = (startSec != null && durSec != null) ? startSec + durSec : (range ? Math.round(range.end) : null);
+        const maxMins = durSec ? Math.round(durSec / 60) : (customDurationMin ? Number(customDurationMin) : null);
+
         const advanced = {
             targetClips: targetClips || null,
             contentPreset: contentPreset || 'gta6',
@@ -144,8 +151,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
             autoHook,
             autoHookStyle,
             layout,
-            sourceStart: range ? Math.round(range.start) : null,
-            sourceEnd: range ? Math.round(range.end) : null,
+            sourceStart: startSec,
+            sourceEnd: endSec,
+            maxMinutes: maxMins,
             liveDurationMinutes: (mode === 'url' && urlPreview?.is_live) ? liveDurationMinutes : null,
             watchLiveChat: (mode === 'url' && urlPreview?.is_live) ? watchLiveChat : null,
             liveMode: (mode === 'url' && urlPreview?.is_live) ? liveMode : null,
@@ -637,6 +645,52 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 material doesn't hold them. Leave blank to let it decide.
                                 {plan === 'free' && ` The free plan makes the ${FREE_CLIPS_PER_VIDEO} to ${FREE_CLIPS_QUIET} best clips of each video, fewer while its queue is busy; plans get every clip, up to ${MAX_CLIPS_PER_VIDEO}.`}
                             </p>
+                            <div className="col-span-1 sm:col-span-3 pt-3 sm:pt-1 border-t border-rule">
+                                <div className="flex items-center justify-between mb-1.5">
+                                    <p className="eyebrow">Source video slice (recommended for long streams &gt;30m)</p>
+                                    <div className="flex gap-1.5">
+                                        {[15, 30, 45, 60].map((mins) => (
+                                            <button
+                                                key={mins}
+                                                type="button"
+                                                onClick={() => { setCustomStartMin('0'); setCustomDurationMin(String(mins)); }}
+                                                className={`px-2 py-0.5 rounded text-[10px] font-mono border transition-colors cursor-pointer ${
+                                                    customDurationMin === String(mins) && (!customStartMin || customStartMin === '0')
+                                                        ? 'border-brass bg-brass/15 text-ink'
+                                                        : 'border-rule2 text-muted hover:border-brass/60'
+                                                }`}
+                                            >
+                                                first {mins}m
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                                <div className="grid grid-cols-2 gap-2">
+                                    <div>
+                                        <span className="text-[11px] text-muted block mb-1">start at minute</span>
+                                        <input
+                                            type="number" min="0" step="1"
+                                            value={customStartMin}
+                                            onChange={(e) => setCustomStartMin(e.target.value)}
+                                            placeholder="0 (start from beginning)"
+                                            className="input-field py-1 text-xs"
+                                        />
+                                    </div>
+                                    <div>
+                                        <span className="text-[11px] text-muted block mb-1">duration (minutes)</span>
+                                        <input
+                                            type="number" min="1" step="1"
+                                            value={customDurationMin}
+                                            onChange={(e) => setCustomDurationMin(e.target.value)}
+                                            placeholder="e.g. 30, 45 (blank = whole file)"
+                                            className="input-field py-1 text-xs"
+                                        />
+                                    </div>
+                                </div>
+                                <p className="text-[11px] text-muted mt-1 leading-relaxed">
+                                    For long multi-hour streams (e.g. 8.5 hours), picking a 30–60 min slice processes in ~2 minutes and prevents system memory overload.
+                                </p>
+                            </div>
                             <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
                                 <span className="text-xs text-ink2">vertical layout</span>
                                 <select
