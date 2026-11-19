@@ -78,7 +78,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
     // force one on so a podcast host who knows what they uploaded doesn't
     // depend on the detector, and 'none' keeps the plain single crop.
     const [layout, setLayout] = useState(() => {
-        try { return localStorage.getItem('os_layout') || 'auto'; } catch { return 'auto'; }
+        try { return localStorage.getItem('os_layout') || 'screencast'; } catch { return 'screencast'; }
     });
     const infoRef = useRef(null);
 
@@ -466,7 +466,10 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     <div className="grid grid-cols-2 gap-2">
                         <button
                             type="button"
-                            onClick={() => setContentPreset('gta6')}
+                            onClick={() => {
+                                setContentPreset('gta6');
+                                if (layout === 'auto' || !layout) setLayout('screencast');
+                            }}
                             className={`p-2.5 rounded-input border text-left transition-colors cursor-pointer ${
                                 contentPreset === 'gta6'
                                     ? 'border-brass bg-brass/15 text-ink'
@@ -485,7 +488,10 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         </button>
                         <button
                             type="button"
-                            onClick={() => setContentPreset('general')}
+                            onClick={() => {
+                                setContentPreset('general');
+                                if (layout === 'screencast' || layout === 'gameplay') setLayout('auto');
+                            }}
                             className={`p-2.5 rounded-input border text-left transition-colors cursor-pointer ${
                                 contentPreset === 'general'
                                     ? 'border-[color:var(--color-accent)] bg-[color:var(--color-accent)]/15 text-ink'
@@ -504,6 +510,80 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         </button>
                     </div>
                 </div>
+
+                {/* Framing Mode: only shown for vertical 9:16 format */}
+                {outputFormat === 'vertical' && (
+                    <div className="mt-5 animate-fade" data-tutorial="framing-mode">
+                        <div className="flex items-center justify-between mb-2">
+                            <p className="eyebrow">Video Framing & Camera Focus</p>
+                            <span className="text-[11px] text-muted">
+                                {layout === 'screencast' && 'Game on top + facecam below'}
+                                {layout === 'gameplay' && '100% center gameplay (no facecam)'}
+                                {layout === 'full' && 'Full 16:9 widescreen + blurred background'}
+                                {layout === 'auto' && 'Tracks speaker face (podcasts)'}
+                            </span>
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                            <button
+                                type="button"
+                                onClick={() => setLayout('screencast')}
+                                className={`p-2.5 rounded-input border text-left transition-colors cursor-pointer ${
+                                    layout === 'screencast'
+                                        ? 'border-brass bg-brass/15 text-ink ring-1 ring-brass/40'
+                                        : 'border-rule2 text-muted hover:border-brass/60 hover:text-ink2'
+                                }`}
+                            >
+                                <span className="block text-xs font-medium text-ink flex items-center justify-between">
+                                    <span>🎮 Gaming Split</span>
+                                    {layout === 'screencast' && (
+                                        <span className="text-[9px] px-1.5 py-0.5 bg-brass text-black rounded font-bold uppercase">Active</span>
+                                    )}
+                                </span>
+                                <span className="block text-[11px] text-muted mt-1 leading-snug">
+                                    Full gameplay on top + streamer reaction cam below (Best for GTA 6 streams)
+                                </span>
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setLayout('gameplay')}
+                                className={`p-2.5 rounded-input border text-left transition-colors cursor-pointer ${
+                                    layout === 'gameplay'
+                                        ? 'border-brass bg-brass/15 text-ink ring-1 ring-brass/40'
+                                        : 'border-rule2 text-muted hover:border-brass/60 hover:text-ink2'
+                                }`}
+                            >
+                                <span className="block text-xs font-medium text-ink flex items-center justify-between">
+                                    <span>🎯 Pure Gameplay</span>
+                                    {layout === 'gameplay' && (
+                                        <span className="text-[9px] px-1.5 py-0.5 bg-brass text-black rounded font-bold uppercase">Active</span>
+                                    )}
+                                </span>
+                                <span className="block text-[11px] text-muted mt-1 leading-snug">
+                                    Centered 9:16 action crop (Ignores webcam, keeps 100% gameplay action)
+                                </span>
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setLayout('auto')}
+                                className={`p-2.5 rounded-input border text-left transition-colors cursor-pointer ${
+                                    layout === 'auto'
+                                        ? 'border-[color:var(--color-accent)] bg-[color:var(--color-accent)]/15 text-ink ring-1 ring-[color:var(--color-accent)]/40'
+                                        : 'border-rule2 text-muted hover:border-[color:var(--color-accent)] hover:text-ink2'
+                                }`}
+                            >
+                                <span className="block text-xs font-medium text-ink flex items-center justify-between">
+                                    <span>👤 Face Focus</span>
+                                    {layout === 'auto' && (
+                                        <span className="text-[9px] px-1.5 py-0.5 bg-[color:var(--color-accent)] text-black rounded font-bold uppercase">Active</span>
+                                    )}
+                                </span>
+                                <span className="block text-[11px] text-muted mt-1 leading-snug">
+                                    Tracks person / talking head (Best for podcasts, interviews & vlogs)
+                                </span>
+                            </button>
+                        </div>
+                    </div>
+                )}
 
                 {/* Advanced generation controls — collapsed by default; blank = AI decides */}
                 <div className="mt-4">
@@ -565,9 +645,11 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                     className="input-field !w-auto text-xs py-1.5"
                                     aria-label="vertical layout"
                                 >
-                                    <option value="auto">Auto (AI picks per video)</option>
+                                    <option value="screencast">🎮 Gaming Split (Screen + Facecam)</option>
+                                    <option value="gameplay">🎯 Pure Gameplay (Centered 9:16 Action)</option>
+                                    <option value="auto">👤 Face Focus / Auto (AI picks)</option>
+                                    <option value="full">📺 Full Frame (16:9 Letterbox)</option>
                                     <option value="split">Two speakers stacked</option>
-                                    <option value="screencast">Screen over presenter</option>
                                     <option value="none">Single crop only</option>
                                 </select>
                             </div>

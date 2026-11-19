@@ -380,6 +380,11 @@ def _trajectory_loop(next_frame, sparse, n_frames, scenes_boundaries,
             cameraman.current_center_x = orig_w / 2
             cameraman.target_center_x = orig_w / 2
             xs.append(None)
+        elif strategy in ('GAMEPLAY', 'CENTER'):
+            cameraman.current_center_x = orig_w / 2
+            cameraman.target_center_x = orig_w / 2
+            x1, _y1, _x2, _y2 = cameraman.get_crop_box(force_snap=True)
+            xs.append(x1)
         else:
             is_scene_start = (
                 current_scene_index < len(scenes_boundaries)
@@ -749,7 +754,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     # five clips that had one, while camera_inset.detect finds all five with no
     # false positives. The box is fixed for the whole video, so it is found once.
     inset = None
-    if content_ranges and screencast_layout.ENABLED:
+    if screencast_layout.ENABLED or force_strategy == 'INSET':
         try:
             inset = camera_inset.detect(input_video)
         except Exception as e:
@@ -762,19 +767,25 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     insets = {}
     wide_count = 0
     inset_count = 0
+    if inset:
+        for scene_idx, (start_f, end_f) in enumerate(scene_boundaries):
+            if force_strategy == 'INSET' or camera_inset.present_in_scene(input_video, inset, start_f, end_f):
+                strategies[scene_idx] = 'INSET'
+                insets[start_f] = inset
+                inset_count += 1
+                splits.pop(start_f, None)
     if content_ranges:
         for scene_idx, (plan, centre) in screencast_layout.detect_screencast_scenes(
                 input_video, scenes, strategies, content_ranges).items():
+            if strategies[scene_idx] == 'INSET':
+                continue
             # An inset beats both screen plans: it is the only one that can show
             # the screen whole AND the person at a readable size. But only on
             # the scenes the camera is actually in: the box is found once per
             # clip, and a tutorial clip mixes shots with and without it.
             start_f, end_f = scene_boundaries[scene_idx]
             box = None
-            if inset and camera_inset.present_in_scene(
-                    input_video, inset, start_f, end_f):
-                box = inset
-            elif plan == 'WIDE' and screencast_layout.presenter_cam(
+            if plan == 'WIDE' and screencast_layout.presenter_cam(
                     start_f / fps, end_f / fps, content_ranges):
                 # A full screen with the presenter's camera floating over it
                 # anywhere, not only in a corner: show it below, enlarged,

@@ -2205,6 +2205,8 @@ def render_clip(input_video, final_output_video, output_format="auto",
     source's own burned-in subtitles off the bottom first, so our captions are
     the only text layer. Every render from the source passes it: the job, the
     recut and the editor's re-render."""
+    if force_strategy is None:
+        force_strategy = os.environ.get("FORCE_STRATEGY") or os.environ.get("FRAMING_STRATEGY")
     trimmed = trim_subtitle_band(input_video, subtitle_band)
     try:
         return _render_clip(trimmed, final_output_video, output_format,

@@ -5695,6 +5695,8 @@ def _reject_short_source(duration: float):
 LAYOUT_ENV = {
     "split": "SPLIT_LAYOUT",          # two speakers stacked
     "screencast": "SCREENCAST_LAYOUT",  # slides/screen share over the speaker
+    "gaming_split": "SCREENCAST_LAYOUT", # gameplay on top, streamer inset cam below
+    "inset": "SCREENCAST_LAYOUT",
     "speaker_cut": "SPEAKER_CUT",     # hard cuts to whoever is talking
     "punch_in": "PUNCH_IN",           # small push on the clip's beats
 }
@@ -5865,6 +5867,22 @@ def layout_env(requested):
             env["AUTO_LAYOUT"] = "1"
             continue
         if key == "none":
+            env["AUTO_LAYOUT"] = "0"
+            continue
+        if key in ("gameplay", "game", "action", "center"):
+            env["FORCE_STRATEGY"] = "GAMEPLAY"
+            env["AUTO_LAYOUT"] = "0"
+            continue
+        if key in ("full", "wide"):
+            env["FORCE_STRATEGY"] = "WIDE"
+            env["AUTO_LAYOUT"] = "0"
+            continue
+        if key in ("screencast", "inset", "gaming_split", "split_cam"):
+            env["SCREENCAST_LAYOUT"] = "1"
+            env["AUTO_LAYOUT"] = "0"
+            continue
+        if key in ("face", "track"):
+            env["FORCE_STRATEGY"] = "TRACK"
             env["AUTO_LAYOUT"] = "0"
             continue
         var = LAYOUT_ENV.get(key)
@@ -7862,7 +7880,15 @@ class RerenderRequest(BaseModel):
 # Manual framing -> reframe-engine strategy. 'full' shows the whole source
 # frame (WIDE: no side-cropping, blurred filler bands); 'track' forces the
 # subject-tracking crop. Anything non-auto needs the retained source video.
-_FRAMING_STRATEGIES = {"auto": None, "full": "WIDE", "track": "TRACK"}
+_FRAMING_STRATEGIES = {
+    "auto": None,
+    "full": "WIDE",
+    "track": "TRACK",
+    "gameplay": "GAMEPLAY",
+    "screencast": "INSET",
+    "inset": "INSET",
+    "split": "SPLIT",
+}
 
 
 # One lock per job (same pattern as _restore_locks): rerenders on the same job
@@ -7933,7 +7959,7 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
     framing = req.framing or (clip.get('recipe') or {}).get('framing') or 'auto'
     if framing not in _FRAMING_STRATEGIES:
         raise HTTPException(status_code=400,
-                            detail="framing must be one of: auto, full, track")
+                            detail=f"framing must be one of: {', '.join(_FRAMING_STRATEGIES)}")
     force_strategy = _FRAMING_STRATEGIES[framing]
 
     try:
