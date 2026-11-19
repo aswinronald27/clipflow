@@ -2917,7 +2917,15 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None, chat_h
         # each batch SELECT instead (the old "up to 3 per batch") capped the
         # shortlist at 3 * n_batches, under the target for any source shorter
         # than ~30 min. See clip_selection.score_batches.
+        user_target_max = 0
+        try:
+            user_target_max = int(os.environ.get("CLIP_TARGET_MAX") or 0)
+        except (ValueError, TypeError):
+            pass
+
         target = shortlist_target(video_duration)
+        if user_target_max > 0:
+            target = max(target, min(len(windows), max(user_target_max * 2, user_target_max + 4)))
         heat = twitch_signals.window_heat(windows, viewer_clips) if viewer_clips else {}
         if heat:
             print(f"   👀 Viewer clips fall in {len(heat)} window(s).")
@@ -2946,7 +2954,8 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None, chat_h
             return out
 
         def _score_prompt(ws):
-            return gemini_worker.SCORE_PROMPT_TEMPLATE.format(
+            template = gemini_worker.get_score_prompt_template()
+            return template.format(
                 video_duration=video_duration, language=language,
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
 
@@ -3003,8 +3012,9 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None, chat_h
         def _detail_prompt_for(lo, hi):
             # A split batch keeps the full clip-count band: a short list can
             # still hold the best clips, and the model returns fewer anyway.
+            template = gemini_worker.get_detail_prompt_template()
             def build(ws):
-                return gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
+                return template.format(
                     video_duration=video_duration, language=language,
                     min_clips=lo, max_clips=hi,
                     min_secs=min_secs, max_secs=max_secs,
@@ -3045,6 +3055,9 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None, chat_h
             if len(shorts) < min_clips:
                 used = {str(s.get("source_window_id") or "") for s in shorts}
                 spare = [w for w in shortlist if w["id"] not in used]
+                if not spare and len(windows) > len(shortlist):
+                    shortlist_ids = {w["id"] for w in shortlist}
+                    spare = [by_id[w["id"]] for w in scored if w.get("id") in by_id and w["id"] not in shortlist_ids][:min_clips - len(shorts) + 3]
                 if spare:
                     missing = min_clips - len(shorts)
                     print(f"   Detail returned {len(shorts)} clip(s) of {min_clips}; "
@@ -3214,7 +3227,8 @@ def _visual_pass(client, model_name, video_path, duration, language,
                 return None, None
             time.sleep(2)
 
-        prompt = gemini_worker.VISUAL_PROMPT_TEMPLATE.format(
+        v_template = gemini_worker.get_visual_prompt_template()
+        prompt = v_template.format(
             video_duration=duration, language=language,
             min_clips=min_clips, max_clips=max_clips,
             min_secs=min_secs, max_secs=max_secs) + (hint or "")

@@ -6012,6 +6012,7 @@ async def process_endpoint(
     webhook_url: Optional[str] = Form(None),
     webhook_secret: Optional[str] = Form(None),
     target_clips: Optional[str] = Form(None),
+    content_preset: Optional[str] = Form(None),
     clip_min_seconds: Optional[str] = Form(None),
     clip_max_seconds: Optional[str] = Form(None),
     auto_hook: Optional[str] = Form(None),
@@ -6049,6 +6050,7 @@ async def process_endpoint(
         webhook_url = body.get("webhook_url")
         webhook_secret = body.get("webhook_secret")
         target_clips = body.get("target_clips")
+        content_preset = body.get("content_preset")
         clip_min_seconds = body.get("clip_min_seconds")
         clip_max_seconds = body.get("clip_max_seconds")
         auto_hook = body.get("auto_hook")
@@ -6203,8 +6205,10 @@ async def process_endpoint(
         env["CLIP_MIN_SECONDS"] = str(min_secs)
     if max_secs is not None:
         env["CLIP_MAX_SECONDS"] = str(max_secs)
-    if n_clips is not None or min_secs is not None or max_secs is not None:
-        print(f"[gen-controls] job={job_id} clips={n_clips} band={min_secs}-{max_secs}")
+    preset = (content_preset or os.environ.get("CONTENT_PRESET", "gta6")).strip().lower()
+    env["CONTENT_PRESET"] = preset
+    if n_clips is not None or min_secs is not None or max_secs is not None or preset:
+        print(f"[gen-controls] job={job_id} clips={n_clips} band={min_secs}-{max_secs} preset={preset}")
 
     # captions=false: the source already carries burned-in subtitles (or the
     # caller adds its own later), so skip the free auto-caption pass instead

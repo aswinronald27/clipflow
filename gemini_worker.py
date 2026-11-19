@@ -87,6 +87,29 @@ to worst by how likely they are to stop a viewer scrolling.
 """
 
 
+GTA6_VISUAL_PROMPT_TEMPLATE = """
+You are a senior gaming video editor specializing in Grand Theft Auto (GTA 6 / GTA VI / Vice City) gameplay and trailers.
+This video has NO speech/audio — judge it purely by what you SEE on screen.
+Watch the whole thing and pick the {min_clips}–{max_clips} MOST action-packed, viral visual moments for TikTok / Reels / Shorts:
+- High-speed driving, police pursuits, PIT maneuvers, vehicle wrecks, bridge jumps, insane airborne stunts.
+- Shootouts, explosions, sniper shots, wanted level spikes, SWAT and helicopter encounters.
+- Ragdoll physics fails, funny character/vehicle glitches, bizarre NPC moments.
+- Vice City neon aesthetics, beach scenes, scenic vistas, dramatic weather, cinematic lighting.
+
+TIME CONTRACT — STRICT:
+- Timestamps in ABSOLUTE SECONDS from the start (usable with ffmpeg -ss/-to).
+- Only numbers with up to 3 decimals (e.g. 0, 12.5, 47.250).
+- 0 <= start < end <= {video_duration}.
+- Each clip {min_secs:g} to {max_secs:g} seconds long. If the whole video is
+  shorter than {min_secs:g}s, return one clip spanning the full video.
+- Cut on visual scene changes, never mid-motion.
+
+For each clip write catchy gaming copy in {language} (a scroll-stopping hook, a TikTok
+and an Instagram description with #gta6 #gaming #shorts, and a YouTube title ≤100 chars). Order clips best
+to worst by how likely they are to stop a viewer scrolling.
+"""
+
+
 # Grounded rewrite of hook + title for a clip whose meaning lives on screen
 # (SCREENCAST / WIDE / INSET stretches): the detail pass never saw a frame,
 # so its hook summarises the topic instead of naming what is being shown.
@@ -380,6 +403,134 @@ Return only:
 }}
 """
 
+GTA6_SCORE_PROMPT_TEMPLATE = """
+You are a senior gaming short-form video strategist specializing in Grand Theft Auto (GTA 6 / GTA VI / Vice City) viral content.
+RANK these candidate windows by how well each would work as an electrifying, high-retention GTA 6 short on TikTok, Reels, and YouTube Shorts.
+
+GTA 6 SCORING CRITERIA:
+- HIGH SCORE (75-100):
+  * Intense police pursuits, 5-star wanted escapes, high-speed highway chases, PIT maneuvers, SWAT/helicopter showdowns.
+  * Shootouts, weapon combat, explosions, rocket launcher chaos, robberies, heists.
+  * Hilarious ragdoll physics fails, vehicle crashes, airborne stunts, bridge jumps, NPC glitches, bizarre open-world moments.
+  * Jason and Lucia storyline moments, dramatic dialogue, clutch mission gameplay.
+  * Streamer / gamer hype reactions: yelling, laughing hysterically, shock, clutch survivals, funny commentary ("NO WAY!", "WATCH THIS!", "HE'S DEAD!").
+  * Leaks, trailer breakdowns, Vice City map secrets, graphics details, hidden Easter eggs.
+- MEDIUM SCORE (40-74):
+  * Entertaining driving sequences, open-world exploration with good commentary, casual mission gameplay.
+- LOW SCORE (0-35):
+  * Menu browsing, settings adjustment, loading screens, silent pauses, low-energy filler.
+
+Rules:
+- Return only valid JSON.
+- Score EVERY window in this batch: exactly one entry per input window, with
+  the id you were given. Do not drop the weak ones — say they are weak.
+- `score` must be an integer from 0 to 100, and the ranking is what matters:
+  use the whole range instead of clustering.
+- THE 2-SECOND TEST is the main criterion: would the first 2 seconds of this
+  moment force a cold viewer scrolling through TikTok/Shorts to stop and watch?
+- A window may carry `viewers_clipped` / `viewer_clip_views`: the stream's own
+  live viewers clipped that stretch themselves. In GTA 6 streams, viewer clips
+  often mark insane stunts, sudden cop ambushes, or hysterical deaths — weigh it up heavily!
+- A window may carry `chat_messages` / `chat_spike_ratio` / `chat_reactions`:
+  treat strong chat spikes (e.g. W, L, OMFG, LOL, 💀, 😭) as high-signal evidence
+  that something hilarious or shocking just happened in the game.
+
+TRANSCRIPT_LANGUAGE: {language}
+VIDEO_DURATION_SECONDS: {video_duration}
+WINDOWS_JSON:
+{windows_json}
+
+Return only:
+{{
+  "windows": [
+    {{
+      "id": "<window id>",
+      "start": <number>,
+      "end": <number>,
+      "score": <integer 0-100>,
+      "reason": "<very short reason>"
+    }}
+  ]
+}}
+"""
+
+GTA6_DETAIL_PROMPT_TEMPLATE = """
+You are a senior gaming video editor and viral short-form copywriter specializing in Grand Theft Auto (GTA 6 / GTA VI) clips.
+Choose the BEST short clips from these shortlisted candidate windows.
+
+CLIP RULES:
+- Return only valid JSON.
+- Each clip must be {min_secs:g} to {max_secs:g} seconds long, in absolute seconds from the start of the source video.
+- Stay within the candidate window boundaries.
+- THE 2-SECOND RULE: the clip MUST open on its strongest moment — the moment the police sirens wail, a car goes flying, gunfire breaks out, or the player screams in shock. If the first 2 seconds do not grab attention immediately, adjust the start.
+- Start slightly before the action and end right after the payoff (the crash, escape, punchline, or reaction).
+- When a window has `viewer_moments` or `chat_hype_moments`, prioritize cutting around those highlights, opening 2-4 seconds before the hype event.
+- Do not cut in the middle of a word or scream.
+- STANDS ALONE: the clip must make complete sense to someone scrolling on their phone who has seen nothing else.
+- HOW MANY: return {min_clips} to {max_clips} clips. Work through EVERY candidate window — they were already scored as the best moments in the video. Two or three clips from one window are fine when they are genuinely different moments.
+- DIVERSITY: never return two clips of the same exact chase or repeated joke. Pick the strongest one.
+- ABOUT THIS MOMENT, NOT THE VIDEO: name the concrete in-game event — the 5-star escape, the bridge stunt, the Lucia cutscene, the helicopter takedown.
+
+GTA 6 VIRAL HOOK PLAYBOOK (max 10 words for `viral_hook_text`):
+- Police Chases: "How did I survive a 5-star chase in GTA 6?"
+- Ragdoll / Physics: "GTA 6 physics are completely unhinged 😂"
+- Chaos / Fails: "Bro tried to escape the Vice City police 💀"
+- Insane Stunts: "This GTA 6 stunt took 50 attempts..."
+- Lucia & Jason / Story: "Lucia and Jason just did the unthinkable"
+- Details / Leaks: "This GTA 6 detail feels completely illegal"
+- Heists / Robberies: "The cleanest heist in GTA 6 history"
+(Always adapt to what actually happens in the clip, written in TRANSCRIPT_LANGUAGE!)
+
+COPY RULES — ALL text fields MUST be written in TRANSCRIPT_LANGUAGE ({language}):
+- `video_title_for_youtube_short`: max 100 chars, click-worthy gaming title (e.g. "5-Star Police Chase in GTA 6 Gone Completely Wrong 💀", "GTA 6 Ragdoll Physics Are Out Of Control!").
+- Descriptions: 1-2 punchy sentences teasing the climax, ending with top hashtags: #gta6 #gtavi #gta #grandtheftauto #gaming #gta6clips #vicecity #shorts #gamingclips.
+- `predicted_score`: 0-100 estimate of viral potential.
+- `why`: one sentence naming what makes this specific GTA 6 moment worth clipping.
+
+TRANSCRIPT_LANGUAGE: {language}
+VIDEO_DURATION_SECONDS: {video_duration}
+CANDIDATE_WINDOWS_JSON:
+{windows_json}
+
+Return only:
+{{
+  "shorts": [
+    {{
+      "start": <number>,
+      "end": <number>,
+      "source_window_id": "<window id>",
+      "predicted_score": <integer 0-100>,
+      "video_description_for_tiktok": "<description + hashtags>",
+      "video_description_for_instagram": "<description + hashtags>",
+      "video_title_for_youtube_short": "<title max 100 chars>",
+      "viral_hook_text": "<short overlay max 10 words>",
+      "why": "<one sentence, max 20 words>"
+    }}
+  ]
+}}
+"""
+
+
+def get_score_prompt_template(preset: str = None) -> str:
+    p = (preset or os.environ.get("CONTENT_PRESET", "gta6")).strip().lower()
+    if p in ("gta6", "gta", "gaming"):
+        return GTA6_SCORE_PROMPT_TEMPLATE
+    return SCORE_PROMPT_TEMPLATE
+
+
+def get_detail_prompt_template(preset: str = None) -> str:
+    p = (preset or os.environ.get("CONTENT_PRESET", "gta6")).strip().lower()
+    if p in ("gta6", "gta", "gaming"):
+        return GTA6_DETAIL_PROMPT_TEMPLATE
+    return DETAIL_PROMPT_TEMPLATE
+
+
+def get_visual_prompt_template(preset: str = None) -> str:
+    p = (preset or os.environ.get("CONTENT_PRESET", "gta6")).strip().lower()
+    if p in ("gta6", "gta", "gaming"):
+        return GTA6_VISUAL_PROMPT_TEMPLATE
+    return VISUAL_PROMPT_TEMPLATE
+
 
 def _strip_code_fences(text: str) -> str:
     text = (text or "").strip()
@@ -610,7 +761,7 @@ def main() -> int:
     config = _config_for_strategy(args.strategy, args.mode, model_name)
     language = str(payload.get("language") or "unknown")
 
-    template = SCORE_PROMPT_TEMPLATE if args.mode == "score" else DETAIL_PROMPT_TEMPLATE
+    template = get_score_prompt_template() if args.mode == "score" else get_detail_prompt_template()
     fmt = {
         "video_duration": payload["video_duration"],
         "language": language,

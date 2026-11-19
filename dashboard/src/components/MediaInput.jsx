@@ -55,7 +55,12 @@ export default function MediaInput({ onProcess, isProcessing }) {
     // Advanced generation controls — empty string means "let the AI decide",
     // which keeps the default pipeline behavior untouched.
     const [showAdvanced, setShowAdvanced] = useState(false);
-    const [targetClips, setTargetClips] = useState('');
+    const [targetClips, setTargetClips] = useState(() => {
+        try { return localStorage.getItem('os_target_clips') || ''; } catch { return ''; }
+    });
+    const [contentPreset, setContentPreset] = useState(() => {
+        try { return localStorage.getItem('os_content_preset') || 'gta6'; } catch { return 'gta6'; }
+    });
     const [clipMinSeconds, setClipMinSeconds] = useState('');
     const [clipMaxSeconds, setClipMaxSeconds] = useState('');
     // Auto-hook: burn the AI hook text into every clip. On by default; the
@@ -131,6 +136,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
         if (!acknowledged) return;
         const advanced = {
             targetClips: targetClips || null,
+            contentPreset: contentPreset || 'gta6',
             clipMinSeconds: clipMinSeconds || null,
             clipMaxSeconds: clipMaxSeconds || null,
             autoHook,
@@ -143,6 +149,8 @@ export default function MediaInput({ onProcess, isProcessing }) {
             liveMode: (mode === 'url' && urlPreview?.is_live) ? liveMode : null,
         };
         try {
+            localStorage.setItem('os_target_clips', targetClips);
+            localStorage.setItem('os_content_preset', contentPreset);
             localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
             localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
             localStorage.setItem('os_layout', layout);
@@ -398,6 +406,100 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 </button>
                             );
                         })}
+                    </div>
+                </div>
+
+                {/* Number of clips to generate */}
+                <div className="mt-5">
+                    <div className="flex items-center justify-between mb-2">
+                        <p className="eyebrow">Clips to generate</p>
+                        <span className="text-[11px] text-muted">
+                            {targetClips ? `${targetClips} clip${targetClips === '1' ? '' : 's'}` : 'All best moments (AI selects)'}
+                        </span>
+                    </div>
+                    <div className="grid grid-cols-6 gap-2">
+                        {[
+                            { value: '', label: 'All Best' },
+                            { value: '3', label: '3' },
+                            { value: '5', label: '5' },
+                            { value: '8', label: '8' },
+                            { value: '10', label: '10' },
+                            { value: '15', label: '15' },
+                        ].map((btn) => {
+                            const active = targetClips === btn.value;
+                            return (
+                                <button
+                                    key={btn.value}
+                                    type="button"
+                                    onClick={() => setTargetClips(btn.value)}
+                                    className={`py-2 px-1 text-center rounded-input border text-xs font-mono transition-colors ${
+                                        active
+                                            ? 'border-[color:var(--color-accent)] bg-[color:var(--color-accent)]/15 text-ink font-semibold'
+                                            : 'border-rule2 text-muted hover:border-[color:var(--color-accent)] hover:text-ink'
+                                    }`}
+                                >
+                                    {btn.label}
+                                </button>
+                            );
+                        })}
+                    </div>
+                    <div className="mt-2 flex items-center gap-2">
+                        <span className="text-[11px] text-muted whitespace-nowrap">or enter number of clips:</span>
+                        <input
+                            type="number"
+                            min="1"
+                            max="25"
+                            step="1"
+                            value={targetClips}
+                            onChange={(e) => setTargetClips(e.target.value)}
+                            placeholder="e.g. 6, 12, 20"
+                            className="input-field py-1 text-xs w-28 text-center"
+                        />
+                    </div>
+                </div>
+
+                {/* AI Recognition Engine Preset */}
+                <div className="mt-5">
+                    <p className="eyebrow mb-2">AI Recognition Mode</p>
+                    <div className="grid grid-cols-2 gap-2">
+                        <button
+                            type="button"
+                            onClick={() => setContentPreset('gta6')}
+                            className={`p-2.5 rounded-input border text-left transition-colors cursor-pointer ${
+                                contentPreset === 'gta6'
+                                    ? 'border-brass bg-brass/15 text-ink'
+                                    : 'border-rule2 text-muted hover:border-brass/60 hover:text-ink2'
+                            }`}
+                        >
+                            <span className="block text-xs font-medium text-ink flex items-center gap-1.5">
+                                🎮 GTA 6 & Gaming
+                                {contentPreset === 'gta6' && (
+                                    <span className="text-[9px] px-1.5 py-0.5 bg-brass text-black rounded font-bold uppercase">Active</span>
+                                )}
+                            </span>
+                            <span className="block text-[11px] text-muted mt-1 leading-snug">
+                                Chases, 5-star police pursuits, stunts, ragdoll fails, Vice City heists & hype reactions
+                            </span>
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setContentPreset('general')}
+                            className={`p-2.5 rounded-input border text-left transition-colors cursor-pointer ${
+                                contentPreset === 'general'
+                                    ? 'border-[color:var(--color-accent)] bg-[color:var(--color-accent)]/15 text-ink'
+                                    : 'border-rule2 text-muted hover:border-[color:var(--color-accent)] hover:text-ink2'
+                            }`}
+                        >
+                            <span className="block text-xs font-medium text-ink flex items-center gap-1.5">
+                                🎙️ General / Podcasts
+                                {contentPreset === 'general' && (
+                                    <span className="text-[9px] px-1.5 py-0.5 bg-[color:var(--color-accent)] text-black rounded font-bold uppercase">Active</span>
+                                )}
+                            </span>
+                            <span className="block text-[11px] text-muted mt-1 leading-snug">
+                                Talks, interviews, debates, commentary & standard short-form hooks
+                            </span>
+                        </button>
                     </div>
                 </div>
 

@@ -1307,6 +1307,7 @@ function App() {
       // default request stays byte-identical to the pre-feature one.
       const advanced = {
         target_clips: data.targetClips || null,
+        content_preset: data.contentPreset || 'gta6',
         clip_min_seconds: data.clipMinSeconds || null,
         clip_max_seconds: data.clipMaxSeconds || null,
         // Sent explicitly both ways: absent means off for raw API callers,
