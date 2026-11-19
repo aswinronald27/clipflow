@@ -139,16 +139,17 @@ _NULL_GATE = _NullGate()
 
 
 class _TranscribeProgress:
-    """Emits '🎙️ Transcribing… NN% (Xs)' lines at 25% steps.
+    """Emits '🎙️ Transcribing… NN% (Xs)' lines.
 
     These are the only transcription lines cloud users see (log_view keeps
     them), so they must stay free of technical detail.
     """
 
-    def __init__(self, total_seconds):
+    def __init__(self, total_seconds, step=5):
         self.total = max(float(total_seconds or 0), 0.0)
         self.started = time.time()
-        self.next_pct = 25
+        self.step = max(1, int(step))
+        self.next_pct = self.step
 
     def update(self, position_seconds):
         if self.total <= 0:
@@ -157,7 +158,7 @@ class _TranscribeProgress:
         while pct >= self.next_pct and self.next_pct <= 100:
             elapsed = int(time.time() - self.started)
             print(f"🎙️ Transcribing… {self.next_pct}% ({elapsed}s)", flush=True)
-            self.next_pct += 25
+            self.next_pct += self.step
 
 # --- whisper singleton ------------------------------------------------------
 
@@ -193,7 +194,25 @@ def _whisper_device():
     return "cpu" if _whisper_force_cpu else get_whisper_config()["device"]
 
 
-def _run_whisper_once(media_path, **params):
+def _extract_wav(media_path):
+    """Extract 16kHz mono PCM wav via ffmpeg.
+    
+    Pre-extracting clean 16kHz audio decodes in seconds, eliminates PyAV container
+    allocation balloons on 10+ GB MP4 files, and allows instant chunk slicing.
+    """
+    print("🎙️ Extracting audio track...", flush=True)
+    fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="asr_")
+    os.close(fd)
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error", "-i", media_path,
+        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path,
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.PIPE, timeout=3600)
+    return wav_path
+
+
+def _run_whisper_once(media_path, progress=None, start_offset=0.0, **params):
     gate = _ASR_GATE if _whisper_device() != "cpu" else _NULL_GATE
     # The model is fetched inside the gate: release_models() drains the gate
     # before unloading, so a transcription can never start on a model that is
@@ -201,15 +220,104 @@ def _run_whisper_once(media_path, **params):
     with gate:
         model, _device = _get_whisper_model()
         segments, info = model.transcribe(media_path, **params)
-        progress = _TranscribeProgress(getattr(info, "duration", 0))
+        prog = progress or _TranscribeProgress(getattr(info, "duration", 0), step=25)
         materialized = []
         for segment in segments:
             materialized.append(segment)
-            progress.update(segment.end)
+            prog.update(start_offset + segment.end)
         # VAD trims trailing silence, so the last segment can end short of the
-        # media duration — force the 100% line.
-        progress.update(progress.total)
+        # media duration — force the 100% line if standalone.
+        if progress is None:
+            prog.update(prog.total)
         return materialized, info
+
+
+def _run_whisper_chunks(audio_path, duration, **params):
+    """Transcribe audio in sequential chunks to keep memory strictly bounded.
+
+    faster-whisper loads the entire audio passed into transcribe() into contiguous
+    memory. For multi-hour videos (e.g. 8.5-hour stream, ~490M audio samples),
+    unchunked decoding balloons past 11 GB and triggers the kernel OOM killer (exit code -9).
+
+    Chunking in sequential slices (e.g. 30 minutes) bounds memory to ~2 GB regardless
+    of video duration, provides live progress updates across the entire file, and
+    cleans up tensors and buffers between chunks with gc.collect().
+    """
+    import gc
+    import math
+
+    chunk_secs = int(os.environ.get("ASR_CHUNK_SECONDS", "1800") or 1800)
+    if duration <= chunk_secs:
+        return _run_whisper_once(audio_path, **params)
+
+    num_chunks = int(math.ceil(duration / chunk_secs))
+    print(
+        f"🎙️ [ASR] Long stream ({duration/3600:.1f}h): transcribing in {num_chunks} "
+        f"chunks of {chunk_secs//60} min to prevent OOM",
+        flush=True,
+    )
+
+    all_segments = []
+    master_info = None
+    detected_language = params.get("language")
+    progress = _TranscribeProgress(duration, step=5)
+
+    for idx in range(num_chunks):
+        start_time = idx * chunk_secs
+        chunk_dur = min(chunk_secs, duration - start_time)
+        fd, chunk_wav = tempfile.mkstemp(suffix=".wav", prefix=f"asr_chunk_{idx}_")
+        os.close(fd)
+        try:
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-ss", f"{start_time:.3f}", "-t", f"{chunk_dur:.3f}",
+                "-i", audio_path, "-c", "copy", chunk_wav,
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+            chunk_params = dict(params)
+            if detected_language:
+                chunk_params["language"] = detected_language
+
+            print(
+                f"   🎙️ [ASR] Chunk {idx+1}/{num_chunks} "
+                f"({start_time/60:.0f}m - {(start_time+chunk_dur)/60:.0f}m)...",
+                flush=True,
+            )
+
+            chunk_segments, chunk_info = _run_whisper_once(
+                chunk_wav, progress=progress, start_offset=start_time, **chunk_params
+            )
+            if master_info is None:
+                master_info = chunk_info
+                if getattr(chunk_info, "language", None):
+                    detected_language = chunk_info.language
+
+            for seg in chunk_segments:
+                seg.start += start_time
+                seg.end += start_time
+                if hasattr(seg, "seek") and seg.seek is not None:
+                    seg.seek += int(start_time)
+                if seg.words:
+                    for w in seg.words:
+                        w.start += start_time
+                        w.end += start_time
+                all_segments.append(seg)
+        finally:
+            if os.path.exists(chunk_wav):
+                try:
+                    os.remove(chunk_wav)
+                except OSError:
+                    pass
+            gc.collect()
+
+    progress.update(progress.total)
+    if master_info is not None:
+        try:
+            master_info.duration = duration
+        except Exception:
+            pass
+    return all_segments, master_info
 
 
 def run_whisper_transcription(media_path, **params):
@@ -227,21 +335,25 @@ def run_whisper_transcription(media_path, **params):
     audio_path = media_path
     cleanup_audio = False
     ext = os.path.splitext(media_path)[1].lower()
-    if ext not in ('.wav', '.mp3', '.aac', '.m4a', '.flac', '.ogg'):
-        tmp_wav = os.path.join(tempfile.gettempdir(), f"asr_{os.getpid()}_{int(time.time()*1000)}.wav")
+
+    if ext not in ('.wav',):
         try:
-            cmd = ["ffmpeg", "-y", "-i", media_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", tmp_wav]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 0:
-                audio_path = tmp_wav
-                cleanup_audio = True
+            audio_path = _extract_wav(media_path)
+            cleanup_audio = True
         except Exception as e:
-            print(f"⚠️ [ASR] audio extraction fallback to direct container ({e})")
+            print(f"⚠️ [ASR] audio extraction fallback to direct container ({e})", flush=True)
             audio_path = media_path
+
+    duration = 0.0
+    if audio_path.endswith('.wav') and os.path.exists(audio_path):
+        try:
+            duration = max(0.0, (os.path.getsize(audio_path) - 44) / 32000.0)
+        except OSError:
+            duration = 0.0
 
     try:
         try:
-            return _run_whisper_once(audio_path, **params)
+            return _run_whisper_chunks(audio_path, duration, **params)
         except RuntimeError as e:
             if _whisper_force_cpu or "cuda" not in str(e).lower():
                 raise
@@ -249,7 +361,7 @@ def run_whisper_transcription(media_path, **params):
             _whisper_force_cpu = True
             with _whisper_lock:
                 _whisper_model = None  # drop the GPU model to release its VRAM
-            return _run_whisper_once(audio_path, **params)
+            return _run_whisper_chunks(audio_path, duration, **params)
     finally:
         if cleanup_audio and os.path.exists(audio_path):
             try:
@@ -492,19 +604,6 @@ def release_models():
         pass
     if "onnxruntime" in sys.modules or "faster_whisper" in sys.modules:
         print("🧹 [ASR] resident models released")
-
-
-def _extract_wav(media_path):
-    """Parakeet wants 16kHz mono PCM wav; ffmpeg-extract to a temp file."""
-    fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="asr_")
-    os.close(fd)
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error", "-i", media_path,
-        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path,
-    ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.PIPE, timeout=1800)
-    return wav_path
 
 
 def _words_from_tokens(tokens, timestamps, seg_start, seg_end):

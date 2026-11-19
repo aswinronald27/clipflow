@@ -2717,11 +2717,18 @@ def transcribe_video(video_path, slot_timeout=None):
             except Exception as e:
                 print(f"⚠️ [ASR] could not release models ({type(e).__name__}: {e})")
 
+    segs = transcript.get('segments', [])
     print(f"   Detected language '{transcript['language']}', "
-          f"{len(transcript['segments'])} segments")
-    for segment in transcript['segments']:
-        # Print progress to keep user informed (and prevent timeouts feeling)
-        print(f"   [{segment['start']:.2f}s -> {segment['end']:.2f}s] {segment['text']}")
+          f"{len(segs)} segments")
+    if len(segs) <= 50:
+        for segment in segs:
+            print(f"   [{segment['start']:.2f}s -> {segment['end']:.2f}s] {segment['text']}")
+    else:
+        for segment in segs[:15]:
+            print(f"   [{segment['start']:.2f}s -> {segment['end']:.2f}s] {segment['text']}")
+        print(f"   ... ({len(segs) - 30} middle segments omitted from log view) ...")
+        for segment in segs[-15:]:
+            print(f"   [{segment['start']:.2f}s -> {segment['end']:.2f}s] {segment['text']}")
 
     return transcript
 
